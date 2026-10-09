@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: '24'
+          node-version: '24.21.0'
       - name: Fetch the certified tarball
         env:
           GH_TOKEN: ${{ github.token }}

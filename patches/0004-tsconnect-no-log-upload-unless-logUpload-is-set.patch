@@ -1,7 +1,7 @@
 From 156d0fea34296862bb59bc116d0c74e8221c4b9e Mon Sep 17 00:00:00 2001
 From: Lars Trieloff <lars@trieloff.net>
 Date: Fri, 9 Oct 2026 17:09:43 +0200
-Subject: [PATCH 4/4] tsconnect: no log upload unless logUpload is set
+Subject: [PATCH] tsconnect: no log upload unless logUpload is set
 
 ---
  cmd/tsconnect/wasm/wasm_js.go | 6 ++++--

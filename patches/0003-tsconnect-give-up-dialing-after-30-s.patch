@@ -1,7 +1,7 @@
 From d8754b8473508a19c0fdf7772367a4a75f0f135b Mon Sep 17 00:00:00 2001
 From: Lars Trieloff <lars@trieloff.net>
 Date: Fri, 9 Oct 2026 16:22:09 +0200
-Subject: [PATCH 3/4] tsconnect: give up dialing after 30 s
+Subject: [PATCH] tsconnect: give up dialing after 30 s
 
 ---
  cmd/tsconnect/wasm/slicc_js.go | 6 +++++-

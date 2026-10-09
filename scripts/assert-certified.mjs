@@ -44,6 +44,10 @@ const outside = execFileSync('tar', ['-tzf', tgz], { encoding: 'utf8' })
   .filter((path) => !path.startsWith('package/') || path.split('/').includes('..'));
 if (outside.length) refuse(`entries outside package/:\n${outside.join('\n')}`);
 
+const entries = execFileSync('tar', ['-tzf', tgz], { encoding: 'utf8' }).split('\n');
+for (const required of ['package/THIRD-PARTY-NOTICES.md', 'package/LICENSE', 'package/dist/main.wasm'])
+  if (!entries.includes(required)) refuse(`the tarball has no ${required}`);
+
 const { name, version } = JSON.parse(execFileSync('tar', ['-xOzf', tgz, 'package/package.json'], { encoding: 'utf8' }));
 if (name !== NAME) refuse(`tarball is ${name}, not ${NAME}`);
 if (!/^\d+\.\d+\.\d+-\d+$/.test(version)) refuse(`version ${version} is not X.Y.Z-N`);

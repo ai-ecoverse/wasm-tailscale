@@ -1,0 +1,86 @@
+From b27e3b178355b9f71c2fd1bc8328630219b10160 Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Fri, 9 Oct 2026 17:35:17 +0200
+Subject: [PATCH] tsconnect: refuse login before run, and keep shields up on
+ login with a key
+
+---
+ cmd/tsconnect/wasm/slicc_js.go | 13 +++++++++++++
+ cmd/tsconnect/wasm/wasm_js.go  | 10 ++++++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/cmd/tsconnect/wasm/slicc_js.go b/cmd/tsconnect/wasm/slicc_js.go
+index 22d15d948..addc8e021 100644
+--- a/cmd/tsconnect/wasm/slicc_js.go
++++ b/cmd/tsconnect/wasm/slicc_js.go
+@@ -423,12 +423,25 @@ func (i *jsIPN) status() string {
+ // loginWithKey starts the backend again with an auth key that arrived after
+ // newIPN (pasted by the user), then logs in with it. The key is only held in
+ // memory, as an option of this one Start.
++//
++// It is refused before run, whose Start applies the prefs (shields up), and
++// it sets ShieldsUp again before logging in, so the node never comes up with
++// shields down, whatever a reused stateStorage holds.
+ func (i *jsIPN) loginWithKey(authKey string) {
++	if !i.started.Load() {
++		log.Printf("login: refused before run")
++		return
++	}
+ 	go func() {
+ 		if err := i.lb.Start(ipn.Options{AuthKey: authKey}); err != nil {
+ 			log.Printf("Start with auth key: %v", err)
+ 			return
+ 		}
++		shields := &ipn.MaskedPrefs{Prefs: ipn.Prefs{ShieldsUp: true}, ShieldsUpSet: true}
++		if _, err := i.lb.EditPrefsAs(shields, ipnauth.Self); err != nil {
++			log.Printf("shields up: %v", err)
++			return
++		}
+ 		i.lb.StartLoginInteractive(context.Background())
+ 	}()
+ }
+diff --git a/cmd/tsconnect/wasm/wasm_js.go b/cmd/tsconnect/wasm/wasm_js.go
+index 730c5f20e..137928d70 100644
+--- a/cmd/tsconnect/wasm/wasm_js.go
++++ b/cmd/tsconnect/wasm/wasm_js.go
+@@ -22,6 +22,7 @@
+ 	"net/netip"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"syscall/js"
+ 	"time"
+ 
+@@ -270,6 +271,10 @@ type jsIPN struct {
+ 
+ 	clientsMu sync.Mutex
+ 	clients   map[[2]bool]*http.Client
++
++	// started is set by run, whose Start applies SLICC's prefs (shields up);
++	// login before run is refused so no Start runs on stored prefs.
++	started atomic.Bool
+ }
+ 
+ var jsIPNState = map[ipn.State]string{
+@@ -290,6 +295,7 @@ type jsIPN struct {
+ }
+ 
+ func (i *jsIPN) run(jsCallbacks js.Value) {
++	i.started.Store(true)
+ 	notifyState := func(state ipn.State) {
+ 		jsCallbacks.Call("notifyState", jsIPNState[state])
+ 	}
+@@ -395,6 +401,10 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
+ }
+ 
+ func (i *jsIPN) login() {
++	if !i.started.Load() {
++		log.Printf("login: refused before run")
++		return
++	}
+ 	go i.lb.StartLoginInteractive(context.Background())
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

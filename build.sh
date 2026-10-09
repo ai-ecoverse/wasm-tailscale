@@ -28,18 +28,23 @@ mkdir -p "$out"
     -o "$out/main.wasm" ./wasm
 )
 cp "$(./tool/go env GOROOT)/lib/wasm/wasm_exec.js" "$out/wasm_exec.js"
+node "$here/scripts/notices.mjs" "$src" "$tags" "$here/package/THIRD-PARTY-NOTICES.md"
 
-node - "$out" "$tag" "$commit" "$version" "$(./tool/go env GOVERSION)" "$here/patches" <<'JS'
+node - "$out" "$tag" "$commit" "$version" "$(./tool/go env GOVERSION)" "$here/patches" "$here/package/THIRD-PARTY-NOTICES.md" <<'JS'
 const { createHash } = require('node:crypto');
 const { readFileSync, readdirSync, writeFileSync } = require('node:fs');
-const [out, tag, commit, version, go, patches] = process.argv.slice(2);
+const [out, tag, commit, version, go, patches, notices] = process.argv.slice(2);
 const sha = (path) => createHash('sha256').update(readFileSync(path)).digest('hex');
 const info = {
   version,
   tailscale: { tag, commit },
   go,
   patches: readdirSync(patches).filter((f) => f.endsWith('.patch')).sort().map((f) => ({ file: f, sha256: sha(`${patches}/${f}`) })),
-  files: { 'main.wasm': sha(`${out}/main.wasm`), 'wasm_exec.js': sha(`${out}/wasm_exec.js`) },
+  files: {
+    'main.wasm': sha(`${out}/main.wasm`),
+    'wasm_exec.js': sha(`${out}/wasm_exec.js`),
+    'THIRD-PARTY-NOTICES.md': sha(notices),
+  },
 };
 writeFileSync(`${out}/build-info.json`, `${JSON.stringify(info, null, 2)}\n`);
 console.log(JSON.stringify(info, null, 2));

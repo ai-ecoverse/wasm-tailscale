@@ -1,7 +1,7 @@
 From 697b4fb54a068fbd07c96b78411b631cac6ac91f Mon Sep 17 00:00:00 2001
 From: Lars Trieloff <lars@trieloff.net>
 Date: Fri, 9 Oct 2026 14:42:11 +0200
-Subject: [PATCH 2/4] tsconnect: shields up by default, login with an auth key
+Subject: [PATCH] tsconnect: shields up by default, login with an auth key
  pasted after start, shieldsUp in status
 
 ---

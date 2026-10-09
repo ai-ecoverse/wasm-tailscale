@@ -12,9 +12,10 @@ On top of upstream tsconnect's `run`, `login`, `logout`, `ssh` and `fetch(url)`:
 - **`dial(network, addr)`:** a raw TCP (or UDP) connection with `read()`, `write()` and `close()`. Each dial gives up after 30 s.
 - **`setExitNode(expr)`:** `""` for none, `auto:any`, an IP, a MagicDNS name or a stable node ID.
 - **`status()`:** the backend state, this node, its peers, the exit node and `shieldsUp`, as JSON.
-- **`login(authKey)`:** logs in with an auth key that arrives after start, for example one pasted by the user. The key is only an option of that one start; it's never stored.
+- **`login(authKey)`:** logs in with an auth key that arrives after start, for example one pasted by the user. The key is only an option of that one start; it's never stored. Both `login()` and `login(authKey)` are refused before `run()`, whose start applies the prefs, and `login(authKey)` sets shields up again before it logs in.
 - **Configuration:** `newIPN` takes `exitNode`, `ephemeral` (default `true`, as upstream) and `logUpload` (default `false`, so nothing goes to `log.tailscale.com`).
 - **Shields up on every start:** tailnet peers can't open connections to the node.
+- **Subnet routes are accepted** (`RouteAll` is true, unlike upstream's tsconnect). Routes that other nodes advertise are used, and traffic to them goes to the advertising peer, not to the exit node.
 - **Build features:** the build keeps `useexitnode`, `peerapiclient` (DNS through the exit node) and `useroutes`. Everything that serves peers (peerapi server, serve, ssh server, taildrop, drive) stays compiled out, as in upstream's wasm build.
 
 ## The package
@@ -22,9 +23,14 @@ On top of upstream tsconnect's `run`, `login`, `logout`, `ssh` and `fetch(url)`:
 - `dist/main.wasm`: about 30 MB, 4.7 MB with brotli.
 - `dist/wasm_exec.js`: from the same Go toolchain.
 - `dist/build-info.json`: the Tailscale tag and commit, the Go version, the sha256 of every patch and file.
+- `THIRD-PARTY-NOTICES.md`: the licences of everything linked into `main.wasm` (see below).
 - `index.d.ts`: the API above.
 
 To load it, run `wasm_exec.js` (it defines `globalThis.Go`), instantiate `main.wasm` with `new Go().importObject`, call `go.run(instance)`, and wait for `globalThis.newIPN`. `newIPN` is a single global per JavaScript realm, so run it in its own worker.
+
+**`stateStorage` holds secrets.** The module keeps `_machinekey`, `log-policy` and the profile state there. With `ephemeral: false`, that includes the node's private key, so whoever holds the storage can act as the node. Embedders must store it like a credential: not in `localStorage` on a shared origin, not in logs. The auth key is never written to `stateStorage`.
+
+`THIRD-PARTY-NOTICES.md` lists every Go module linked into `main.wasm`, with its licence, copyright and NOTICE files, plus the Go standard library's licence. `build.sh` generates it from `go list -deps` with the build's tags.
 
 Versions are `<tailscale version>-<n>`, for example `1.104.1-1`; `n` counts builds of the same tag.
 
@@ -35,7 +41,7 @@ Versions are `<tailscale version>-<n>`, for example `1.104.1-1`; `n` counts buil
 node test/smoke.mjs # reaches Tailscale's control plane, checks shields up and the API
 ```
 
-The build uses Tailscale's pinned Go toolchain (`./tool/go`), `-trimpath`, `-buildvcs=false` and an empty build ID, so the same tag and patches give the same `main.wasm` on any machine. The packed tarball holds the same files everywhere; only its gzip bytes vary by platform.
+The build uses Tailscale's pinned Go toolchain (`./tool/go`), `-trimpath`, `-buildvcs=false` and an empty build ID, so the same tag and patches give the same `main.wasm` on any machine. The packed tarball holds the same files everywhere. Its gzip bytes depend on Node's zlib, so CI pins Node `24.21.0`, and `publish` publishes the certified CI artifact itself rather than a repack.
 
 ## Updating
 
@@ -48,10 +54,11 @@ To move to a new Tailscale tag, rebase the patch series onto it. In a Tailscale 
   - a tarball whose sha256 isn't the certified one;
   - a tarball whose files differ from the fresh build (compared by the uncompressed tar, because gzip's output differs between platforms while the files don't);
   - links, or entries outside `package/`;
+  - a tarball without `THIRD-PARTY-NOTICES.md`, `LICENSE` or `dist/main.wasm`;
   - a different package name, or a version that isn't `X.Y.Z-N`.
 
   A version already on npm is skipped. `scripts/pack.sh` packs locally the way CI does and prints the sha256.
 
 ## License
 
-BSD 3-Clause, as Tailscale's (see [LICENSE](LICENSE)). The patches are under the same license.
+BSD 3-Clause, as Tailscale's (see [LICENSE](LICENSE)). The patches are under the same license. `main.wasm` also contains code under Apache-2.0, MIT and BSD licences; see `THIRD-PARTY-NOTICES.md` in the package.

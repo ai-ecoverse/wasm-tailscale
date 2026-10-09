@@ -16,6 +16,10 @@ const ipn = globalThis.newIPN({
   stateStorage: { getState: (k) => state.get(k) ?? '', setState: (k, v) => state.set(k, v) },
   hostname: 'wasm-tailscale-smoke',
 });
+ipn.login('tskey-auth-not-a-real-key');
+ipn.login();
+await new Promise((resolve) => setTimeout(resolve, 2000));
+assert.equal(JSON.parse(ipn.status()).state, 'NoState', 'login before run must not start the backend');
 const timer = setTimeout(() => {
   console.error('no login URL within 60 s');
   globalThis.process.exit(1);
@@ -29,7 +33,7 @@ ipn.run({
     clearTimeout(timer);
     const status = JSON.parse(ipn.status());
     assert.match(url, /^https:\/\/login\.tailscale\.com\//);
-    assert.equal(status.shieldsUp, true);
+    assert.equal(status.shieldsUp, true, 'shields up after a login that was attempted before run');
     for (const name of ['fetch', 'dial', 'setExitNode', 'status', 'login'])
       assert.equal(typeof ipn[name], 'function', name);
     console.log(`ok: reached the control plane, shields up, ${state.size} state keys`);

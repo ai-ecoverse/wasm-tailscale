@@ -1,7 +1,7 @@
 From 91d453890beafc89d435f620c3f10a814b02daa2 Mon Sep 17 00:00:00 2001
 From: Lars Trieloff <lars@trieloff.net>
 Date: Fri, 9 Oct 2026 12:50:23 +0200
-Subject: [PATCH 1/4] tsconnect: SLICC transport APIs (fetch, dial, exit nodes,
+Subject: [PATCH] tsconnect: SLICC transport APIs (fetch, dial, exit nodes,
  status)
 
 ---
