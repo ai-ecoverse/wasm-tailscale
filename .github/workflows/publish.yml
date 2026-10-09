@@ -39,7 +39,9 @@ jobs:
           gh run download "$RUN" --repo "$GITHUB_REPOSITORY" --name package --dir "$RUNNER_TEMP/certified"
           find "$RUNNER_TEMP/certified" -name '*.tgz' -exec mv {} "$RUNNER_TEMP/certified.tgz" \;
       - run: ./build.sh
-      - run: node test/smoke.mjs
+      - name: Smoke test
+        timeout-minutes: 3
+        run: node test/smoke.mjs
       - name: Pack a fresh build
         run: |
           cp README.md LICENSE package/

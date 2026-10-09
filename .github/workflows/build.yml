@@ -18,6 +18,7 @@ jobs:
       - name: Build from the pinned tag and the patches
         run: ./build.sh
       - name: Smoke test (control plane, shields up, API)
+        timeout-minutes: 3
         run: node test/smoke.mjs
       - name: Pack
         run: |

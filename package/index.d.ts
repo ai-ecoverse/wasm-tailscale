@@ -10,7 +10,8 @@ export interface IPNConfig {
   /**
    * Where the node keeps its state: `_machinekey`, `log-policy` and the
    * profile, which with `ephemeral: false` holds the node's private key.
-   * Treat it as a secret. The auth key is never written here.
+   * Treat it as a secret. The auth key is never written here. Called
+   * synchronously from Go: don't call back into the IPN from it.
    */
   stateStorage?: { getState(id: string): string; setState(id: string, value: string): void };
   /** Used for one login only, never stored. */
@@ -22,6 +23,7 @@ export interface IPNConfig {
   logUpload?: boolean;
 }
 
+/** Delivered asynchronously, in order, each on its own JS task. */
 export interface IPNCallbacks {
   notifyState(state: string): void;
   notifyNetMap(netMap: string): void;
@@ -66,6 +68,6 @@ export interface IPN {
   }): Promise<IPNResponse>;
   dial(network: 'tcp' | 'udp', addr: string): Promise<IPNConn>;
   setExitNode(expr: string): Promise<void>;
-  /** JSON. Don't call it synchronously inside notifyState/notifyNetMap: that can deadlock. */
-  status(): string;
+  /** JSON. Safe in the notify* callbacks (they run on their own task); returns an Error inside stateStorage callbacks instead of hanging. */
+  status(): string | Error;
 }

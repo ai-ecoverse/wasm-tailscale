@@ -1,0 +1,141 @@
+From 54e48ca1e52fb53c650d0081fc9685addb4a6ef1 Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Fri, 9 Oct 2026 18:44:53 +0200
+Subject: [PATCH] tsconnect: deliver notify callbacks on their own JS task, so
+ calling back into Go from them can't deadlock; status() returns an Error
+ inside stateStorage callbacks; logout reads state off the callback path
+
+---
+ cmd/tsconnect/wasm/slicc_js.go | 29 +++++++++++++++++++++++++++++
+ cmd/tsconnect/wasm/wasm_js.go  | 22 +++++++++++++---------
+ 2 files changed, 42 insertions(+), 9 deletions(-)
+
+diff --git a/cmd/tsconnect/wasm/slicc_js.go b/cmd/tsconnect/wasm/slicc_js.go
+index 970291093..076e9f1dd 100644
+--- a/cmd/tsconnect/wasm/slicc_js.go
++++ b/cmd/tsconnect/wasm/slicc_js.go
+@@ -20,6 +20,7 @@
+ 	"strconv"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"syscall/js"
+ 	"time"
+ 
+@@ -479,3 +480,31 @@ func (i *jsIPN) enforcePrefs(why string) bool {
+ 	}
+ 	return true
+ }
++
++// inCallback counts the synchronous JS callbacks (stateStorage) Go is
++// inside. They can run while the backend holds the lock that status() needs,
++// and js/wasm has one thread, so status() returns an Error instead of
++// hanging when it is called from one.
++var inCallback atomic.Int32
++
++const errStatusInCallback = "status() called from inside a stateStorage callback; defer it, for example with setTimeout(…, 0)"
++
++func callJS(target js.Value, method string, args ...any) js.Value {
++	inCallback.Add(1)
++	defer inCallback.Add(-1)
++	return target.Call(method, args...)
++}
++
++// callLater delivers a notify callback on its own JS task, never inside a
++// call from Go: a callback that calls back into Go synchronously (status(),
++// login()) would otherwise deadlock js/wasm's single thread, on the
++// backend's lock or on Go's event handling. Callbacks keep their order.
++func callLater(target js.Value, method string, args ...any) {
++	var f js.Func
++	f = js.FuncOf(func(js.Value, []js.Value) any {
++		defer f.Release()
++		target.Call(method, args...)
++		return nil
++	})
++	js.Global().Call("setTimeout", f, 0)
++}
+diff --git a/cmd/tsconnect/wasm/wasm_js.go b/cmd/tsconnect/wasm/wasm_js.go
+index 1003b4cb7..3b9f3c7f9 100644
+--- a/cmd/tsconnect/wasm/wasm_js.go
++++ b/cmd/tsconnect/wasm/wasm_js.go
+@@ -256,6 +256,10 @@ func newIPN(jsConfig js.Value) map[string]any {
+ 			return jsIPN.setExitNode(expr)
+ 		}),
+ 		"status": js.FuncOf(func(this js.Value, args []js.Value) any {
++			if inCallback.Load() > 0 {
++				log.Printf("status: %s", errStatusInCallback)
++				return js.Global().Get("Error").New(errStatusInCallback)
++			}
+ 			return jsIPN.status()
+ 		}),
+ 	}
+@@ -300,7 +304,7 @@ type jsIPN struct {
+ func (i *jsIPN) run(jsCallbacks js.Value) {
+ 	i.started.Store(true)
+ 	notifyState := func(state ipn.State) {
+-		jsCallbacks.Call("notifyState", jsIPNState[state])
++		callLater(jsCallbacks, "notifyState", jsIPNState[state])
+ 	}
+ 	notifyState(ipn.NoState)
+ 
+@@ -312,7 +316,7 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
+ 		defer func() {
+ 			if r := recover(); r != nil {
+ 				fmt.Println("Panic recovered:", r)
+-				jsCallbacks.Call("notifyPanicRecover", fmt.Sprint(r))
++				callLater(jsCallbacks, "notifyPanicRecover", fmt.Sprint(r))
+ 			}
+ 		}()
+ 		log.Printf("NOTIFY: %+v", n)
+@@ -362,14 +366,14 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
+ 					LockedOut: nm.TKAEnabled && nm.SelfNode.KeySignature().Len() == 0,
+ 				}
+ 				if jsonNetMap, err := json.Marshal(jsNetMap); err == nil {
+-					jsCallbacks.Call("notifyNetMap", string(jsonNetMap))
++					callLater(jsCallbacks, "notifyNetMap", string(jsonNetMap))
+ 				} else {
+ 					log.Printf("Could not generate JSON netmap: %v", err)
+ 				}
+ 			}
+ 		}
+ 		if n.BrowseToURL != nil {
+-			jsCallbacks.Call("notifyBrowseToURL", *n.BrowseToURL)
++			callLater(jsCallbacks, "notifyBrowseToURL", *n.BrowseToURL)
+ 		}
+ 	})
+ 
+@@ -422,10 +426,10 @@ func (i *jsIPN) login() {
+ }
+ 
+ func (i *jsIPN) logout() {
+-	if i.lb.State() == ipn.NoState {
+-		log.Printf("Backend not running")
+-	}
+ 	go func() {
++		if i.lb.State() == ipn.NoState {
++			log.Printf("Backend not running")
++		}
+ 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+ 		defer cancel()
+ 		i.lb.Logout(ctx, ipnauth.Self)
+@@ -661,7 +665,7 @@ type jsStateStore struct {
+ }
+ 
+ func (s *jsStateStore) ReadState(id ipn.StateKey) ([]byte, error) {
+-	jsValue := s.jsStateStorage.Call("getState", string(id))
++	jsValue := callJS(s.jsStateStorage, "getState", string(id))
+ 	if jsValue.String() == "" {
+ 		return nil, ipn.ErrStateNotExist
+ 	}
+@@ -669,7 +673,7 @@ func (s *jsStateStore) ReadState(id ipn.StateKey) ([]byte, error) {
+ }
+ 
+ func (s *jsStateStore) WriteState(id ipn.StateKey, bs []byte) error {
+-	s.jsStateStorage.Call("setState", string(id), hex.EncodeToString(bs))
++	callJS(s.jsStateStorage, "setState", string(id), hex.EncodeToString(bs))
+ 	return nil
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
