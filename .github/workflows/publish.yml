@@ -41,7 +41,9 @@ jobs:
       - run: ./build.sh
       - name: Smoke test
         timeout-minutes: 3
-        run: node test/smoke.mjs
+        run: |
+          node test/smoke.mjs
+          node test/empty-control-url.mjs
       - name: Pack a fresh build
         run: |
           cp README.md LICENSE package/

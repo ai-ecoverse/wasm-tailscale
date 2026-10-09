@@ -13,7 +13,7 @@ On top of upstream tsconnect's `run`, `login`, `logout`, `ssh` and `fetch(url)`:
 - **`setExitNode(expr)`:** `""` for none, `auto:any`, an IP, a MagicDNS name or a stable node ID.
 - **`status()`:** the backend state, this node, its peers, the exit node, `shieldsUp` and `controlURL`, as JSON. It can be called from the `notify*` callbacks, which the patches deliver on their own JS task. Upstream calls them synchronously from inside Go, where calling back into Go deadlocks js/wasm's single thread. The `stateStorage` callbacks have to stay synchronous, because Go needs `getState`'s answer. Inside them, `status()` returns an `Error` instead of hanging. Defer it there with `setTimeout(…, 0)`.
 - **`login(authKey)`:** logs in with an auth key that arrives after start, for example one pasted by the user. The key is only an option of that one start; it's never stored. Both `login()` and `login(authKey)` are refused before `run()`, and wait for `run()`'s start to finish.
-- **Configuration:** `newIPN` takes `exitNode`, `ephemeral` (default `true`, as upstream) and `logUpload` (default `false`, so nothing goes to `log.tailscale.com`).
+- **Configuration:** `newIPN` takes `exitNode`, `ephemeral` (default `true`, as upstream) and `logUpload` (default `false`, so nothing goes to `log.tailscale.com`). An empty `controlURL` means Tailscale's default control server.
 - **Shields up, kept up:** tailnet peers can't open connections to the node. `run()`'s start sets shields up, the configured control server, the hostname and accepted routes. The same prefs are applied again before every login (with or without a key), after `logout()` (which replaces the profile with Tailscale's defaults: shields down, the default control server), and whenever a prefs change drops any of them. Logins wait until `run()`'s start has returned.
 - **Subnet routes are accepted** (`RouteAll` is true, unlike upstream's tsconnect). Routes that other nodes advertise are used, and traffic to them goes to the advertising peer, not to the exit node.
 - **Build features:** the build keeps `useexitnode`, `peerapiclient` (DNS through the exit node) and `useroutes`. Everything that serves peers (peerapi server, serve, ssh server, taildrop, drive) stays compiled out, as in upstream's wasm build.
@@ -39,6 +39,7 @@ Versions are `<tailscale version>-<n>`, for example `1.104.1-1`; `n` counts buil
 ```sh
 ./build.sh          # clones into .build/tailscale, or set TAILSCALE_SRC
 node test/smoke.mjs # reaches Tailscale's control plane, checks shields up and the API
+node test/empty-control-url.mjs # an empty controlURL settles on the default
 node test/logout-check.mjs # interactive: join, logout, login again; prints sign-in links to /tmp/logout-check.out
 ```
 

@@ -19,7 +19,9 @@ jobs:
         run: ./build.sh
       - name: Smoke test (control plane, shields up, API)
         timeout-minutes: 3
-        run: node test/smoke.mjs
+        run: |
+          node test/smoke.mjs
+          node test/empty-control-url.mjs
       - name: Pack
         run: |
           cp README.md LICENSE package/

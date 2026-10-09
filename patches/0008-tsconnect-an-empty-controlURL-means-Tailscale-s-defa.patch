@@ -1,0 +1,29 @@
+From 22e5501992899e74d0e942390d4d60e5860c17e8 Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Fri, 9 Oct 2026 19:05:41 +0200
+Subject: [PATCH] tsconnect: an empty controlURL means Tailscale's default
+ control server
+
+---
+ cmd/tsconnect/wasm/wasm_js.go | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/cmd/tsconnect/wasm/wasm_js.go b/cmd/tsconnect/wasm/wasm_js.go
+index 3b9f3c7f9..ab0c0b1c0 100644
+--- a/cmd/tsconnect/wasm/wasm_js.go
++++ b/cmd/tsconnect/wasm/wasm_js.go
+@@ -76,6 +76,11 @@ func newIPN(jsConfig js.Value) map[string]any {
+ 	if jsControlURL := jsConfig.Get("controlURL"); jsControlURL.Type() == js.TypeString {
+ 		controlURL = jsControlURL.String()
+ 	}
++	if controlURL == "" {
++		// The backend fills an empty ControlURL in with the default, which
++		// the prefs watcher would then keep resetting to "".
++		controlURL = ipn.DefaultControlURL
++	}
+ 
+ 	var authKey string
+ 	if jsAuthKey := jsConfig.Get("authKey"); jsAuthKey.Type() == js.TypeString {
+-- 
+2.54.0 (Apple Git-157)
+
