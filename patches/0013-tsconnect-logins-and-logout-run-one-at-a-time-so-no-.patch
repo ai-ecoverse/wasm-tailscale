@@ -1,0 +1,70 @@
+From b55e24281768a29913b90833a7306074a4180b09 Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Fri, 9 Oct 2026 21:06:24 +0200
+Subject: [PATCH] tsconnect: logins and logout run one at a time, so no login
+ meets a backend between control clients
+
+---
+ cmd/tsconnect/wasm/slicc_js.go | 4 +++-
+ cmd/tsconnect/wasm/wasm_js.go  | 9 +++++++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/cmd/tsconnect/wasm/slicc_js.go b/cmd/tsconnect/wasm/slicc_js.go
+index 84be4356d..491c7f6db 100644
+--- a/cmd/tsconnect/wasm/slicc_js.go
++++ b/cmd/tsconnect/wasm/slicc_js.go
+@@ -446,6 +446,8 @@ func (i *jsIPN) loginWithKey(authKey string) {
+ 	}
+ 	go func() {
+ 		<-i.ready
++		i.logins.Lock()
++		defer i.logins.Unlock()
+ 		if !i.restartIfFailed() || !i.enforcePrefs("login with key") {
+ 			return
+ 		}
+@@ -544,7 +546,7 @@ func newIPNError(step string, err error) js.Value {
+ 	return js.Global().Get("Error").New(message)
+ }
+ 
+-// restartIfFailed runs run's Start again when it failed, since a backend
++// restartIfFailed (called with i.logins held) runs run's Start again when it failed, since a backend
+ // without a control client panics on StartLoginInteractive. It reports a
+ // second failure through notifyPanicRecover and answers whether the backend
+ // is started now.
+diff --git a/cmd/tsconnect/wasm/wasm_js.go b/cmd/tsconnect/wasm/wasm_js.go
+index adc6faba7..c42289f65 100644
+--- a/cmd/tsconnect/wasm/wasm_js.go
++++ b/cmd/tsconnect/wasm/wasm_js.go
+@@ -294,6 +294,11 @@ type jsIPN struct {
+ 	runPrefs    *ipn.Prefs
+ 	startFailed atomic.Bool
+ 	callbacks   js.Value
++
++	// logins serialises each login's whole sequence: LocalBackend.Start
++	// drops the control client before it takes its lock, so a concurrent
++	// StartLoginInteractive would find none and panic.
++	logins sync.Mutex
+ }
+ 
+ var jsIPNState = map[ipn.State]string{
+@@ -436,6 +441,8 @@ func (i *jsIPN) login() {
+ 	}
+ 	go func() {
+ 		<-i.ready
++		i.logins.Lock()
++		defer i.logins.Unlock()
+ 		if !i.restartIfFailed() || !i.enforcePrefs("login") {
+ 			return
+ 		}
+@@ -445,6 +452,8 @@ func (i *jsIPN) login() {
+ 
+ func (i *jsIPN) logout() {
+ 	go func() {
++		i.logins.Lock()
++		defer i.logins.Unlock()
+ 		if i.lb.State() == ipn.NoState {
+ 			log.Printf("Backend not running")
+ 		}
+-- 
+2.54.0 (Apple Git-157)
+

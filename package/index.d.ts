@@ -49,6 +49,7 @@ export interface IPNConn {
   write(bytes: Uint8Array): Promise<number>;
   /** shutdown(SHUT_WR): the peer reads the end of the stream. */
   closeWrite(): void;
+  /** After close(), don't call this connection's functions: they are released about a second later. */
   close(): void;
 }
 

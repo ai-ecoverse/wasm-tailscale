@@ -47,6 +47,8 @@ jobs:
           node test/throwing-callbacks.mjs
           node test/storage-failure.mjs newipn
           node test/storage-failure.mjs start
+          node test/login-bursts.mjs healthy
+          node test/login-bursts.mjs failed-start
       - name: Pack a fresh build
         run: |
           cp README.md LICENSE package/
