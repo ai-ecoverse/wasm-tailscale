@@ -18,6 +18,7 @@ while (typeof globalThis.newIPN !== 'function') await new Promise((resolve) => s
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const state = new Map();
 let broken = scenario === 'newipn';
+let browsedTo = () => {};
 
 const ipn = globalThis.newIPN({
   stateStorage: {
@@ -45,13 +46,33 @@ if (scenario === 'newipn') {
   ipn.run({
     notifyState: () => {},
     notifyNetMap: () => {},
-    notifyBrowseToURL: () => {},
+    notifyBrowseToURL: (u) => browsedTo(u),
     notifyPanicRecover: (error) => recovered.push(error),
   });
   for (let waited = 0; waited < 8000 && recovered.length === 0; waited += 100) await wait(100);
   console.error(`state ${JSON.parse(ipn.status()).state}, recovered: ${recovered.join(' | ').slice(0, 160)}`);
   assert.ok(recovered.some((e) => e.startsWith('Tailscale could not start: ')), 'a failed start is reported');
   assert.equal(ended, false, 'the Go program is still running');
-  console.error('ok: a start whose storage fails is reported through notifyPanicRecover');
+  const before = recovered.length;
+  ipn.login();
+  for (let waited = 0; waited < 8000 && recovered.length === before; waited += 100) await wait(100);
+  assert.equal(ended, false, 'login() after a failed start does not end the program');
+  assert.ok(recovered.length > before, 'login() with storage still broken reports the failure again');
+  broken = false;
+  let url = null;
+  const watch = setInterval(() => {
+    const st = JSON.parse(ipn.status());
+    if (st.state === 'NeedsLogin' && !url) url = 'needs-login';
+  }, 200);
+  browsedTo = (u) => {
+    url = u;
+  };
+  ipn.login();
+  for (let waited = 0; waited < 30000 && !(url ?? '').startsWith('https://'); waited += 100) await wait(100);
+  clearInterval(watch);
+  assert.match(url ?? '', /^https:\/\/login\.tailscale\.com\//, 'with storage restored, login() reaches NeedsLogin with a URL');
+  assert.equal(JSON.parse(ipn.status()).state, 'NeedsLogin');
+  assert.equal(ended, false);
+  console.error('ok: a start whose storage fails is reported, login() retries it, and works once storage recovers');
 }
 globalThis.process.exit(0);

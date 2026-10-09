@@ -9,13 +9,13 @@ This repo holds no Tailscale source. It pins a Tailscale tag in [`upstream.json`
 On top of upstream tsconnect's `run`, `login`, `logout`, `ssh` and `fetch(url)`:
 
 - **`fetch(request)`:** a full HTTP request (method, headers, body) through the tailnet, with a streamed response (`read()` / `cancel()`). `manualRedirects` returns redirects unfollowed. With `encodedBodies` off, Go negotiates gzip and decodes the body. TLS is Go's own, verified against Mozilla's root certificates, which the build embeds because Go has no system roots under `js/wasm`. No CORS applies.
-- **`dial(network, addr)`:** a raw TCP (or UDP) connection with `read()`, `write()` and `close()`. Each dial gives up after 30 s.
+- **`dial(network, addr)`:** a raw TCP (or UDP) connection with `read()`, `write()`, `closeWrite()` (`shutdown(SHUT_WR)`) and `close()`. Each dial gives up after 30 s.
 - **`setExitNode(expr)`:** `""` for none, `auto:any`, an IP, a MagicDNS name or a stable node ID.
 - **`status()`:** the backend state, this node, its peers, the exit node, `shieldsUp` and `controlURL`, as JSON. It can be called from the `notify*` callbacks, which the patches deliver on their own JS task. Upstream calls them synchronously from inside Go, where calling back into Go deadlocks js/wasm's single thread. The `stateStorage` callbacks have to stay synchronous, because Go needs `getState`'s answer. Inside them, `status()` returns an `Error` instead of hanging. Defer it there with `setTimeout(…, 0)`. A callback that throws doesn't end the Go program:
   - a throwing `notify*` callback is reported through `notifyPanicRecover`, and the node keeps running;
   - a throwing `stateStorage` callback becomes a storage error inside Go. What follows depends on when it happens:
     - while `newIPN` builds the backend, `newIPN` returns an `Error` (`newIPN: <step>: …`) instead of a node;
-    - during `run()`'s start, the node stays stopped in `NoState`, and `notifyPanicRecover` reports `Tailscale could not start: …`;
+    - during `run()`'s start, the node stays stopped in `NoState`, and `notifyPanicRecover` reports `Tailscale could not start: …`. A later `login()` or `login(key)` runs the start again: once storage works, it reaches `NeedsLogin`; if it still fails, it reports the failure again;
     - later, Tailscale handles it like any failed state write: the change isn't saved, and the node keeps running.
 - **`login(authKey)`:** logs in with an auth key that arrives after start, for example one pasted by the user. The key is only an option of that one start; it's never stored. Both `login()` and `login(authKey)` are refused before `run()`, and wait for `run()`'s start to finish.
 - **Configuration:** `newIPN` takes `exitNode`, `ephemeral` (default `true`, as upstream) and `logUpload` (default `false`, so nothing goes to `log.tailscale.com`). An empty `controlURL` means Tailscale's default control server.
@@ -47,7 +47,7 @@ node test/smoke.mjs # reaches Tailscale's control plane, checks shields up and t
 node test/empty-control-url.mjs # an empty controlURL settles on the default
 node test/throwing-callbacks.mjs # throwing callbacks are survived and reported
 node test/storage-failure.mjs newipn # broken storage: newIPN returns an Error
-node test/storage-failure.mjs start  # broken storage during run(): reported, node stays stopped
+node test/storage-failure.mjs start  # broken storage during run(): reported, login() retries, works once storage recovers
 node test/logout-check.mjs # interactive: join, logout, login again; prints sign-in links to /tmp/logout-check.out
 ```
 

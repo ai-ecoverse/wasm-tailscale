@@ -47,6 +47,8 @@ export interface IPNConn {
   remoteAddr: string;
   read(): Promise<Uint8Array | null>;
   write(bytes: Uint8Array): Promise<number>;
+  /** shutdown(SHUT_WR): the peer reads the end of the stream. */
+  closeWrite(): void;
   close(): void;
 }
 
@@ -57,7 +59,7 @@ export interface IPNConn {
  */
 export interface IPN {
   run(callbacks: IPNCallbacks): void;
-  /** Refused before run(); waits for run()'s start, and re-applies shields up, the control URL, hostname and routes first. */
+  /** Refused before run(); waits for run()'s start (and runs it again if it failed), and re-applies shields up, the control URL, hostname and routes first. */
   login(authKey?: string): void;
   logout(): void;
   fetch(request: {

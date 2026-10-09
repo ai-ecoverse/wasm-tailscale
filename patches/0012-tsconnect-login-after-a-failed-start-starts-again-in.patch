@@ -1,0 +1,96 @@
+From 59c7f6a3484ebe1dffd29bd63a718668719463c3 Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Fri, 9 Oct 2026 20:38:07 +0200
+Subject: [PATCH] tsconnect: login after a failed start starts again instead of
+ panicking, and reports a second failure
+
+---
+ cmd/tsconnect/wasm/slicc_js.go | 19 ++++++++++++++++++-
+ cmd/tsconnect/wasm/wasm_js.go  | 12 +++++++++++-
+ 2 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/cmd/tsconnect/wasm/slicc_js.go b/cmd/tsconnect/wasm/slicc_js.go
+index f7489c117..84be4356d 100644
+--- a/cmd/tsconnect/wasm/slicc_js.go
++++ b/cmd/tsconnect/wasm/slicc_js.go
+@@ -446,7 +446,7 @@ func (i *jsIPN) loginWithKey(authKey string) {
+ 	}
+ 	go func() {
+ 		<-i.ready
+-		if !i.enforcePrefs("login with key") {
++		if !i.restartIfFailed() || !i.enforcePrefs("login with key") {
+ 			return
+ 		}
+ 		if err := i.lb.Start(ipn.Options{AuthKey: authKey}); err != nil {
+@@ -543,3 +543,20 @@ func newIPNError(step string, err error) js.Value {
+ 	log.Print(message)
+ 	return js.Global().Get("Error").New(message)
+ }
++
++// restartIfFailed runs run's Start again when it failed, since a backend
++// without a control client panics on StartLoginInteractive. It reports a
++// second failure through notifyPanicRecover and answers whether the backend
++// is started now.
++func (i *jsIPN) restartIfFailed() bool {
++	if !i.startFailed.Load() {
++		return true
++	}
++	if err := i.lb.Start(ipn.Options{UpdatePrefs: i.runPrefs.Clone()}); err != nil {
++		log.Printf("login: Start again: %v", err)
++		callLater(i.callbacks, "notifyPanicRecover", fmt.Sprintf("Tailscale could not start: %v", err))
++		return false
++	}
++	i.startFailed.Store(false)
++	return true
++}
+diff --git a/cmd/tsconnect/wasm/wasm_js.go b/cmd/tsconnect/wasm/wasm_js.go
+index afa6d4841..adc6faba7 100644
+--- a/cmd/tsconnect/wasm/wasm_js.go
++++ b/cmd/tsconnect/wasm/wasm_js.go
+@@ -287,6 +287,13 @@ type jsIPN struct {
+ 	// closed once run's Start has returned; logins wait for it.
+ 	started atomic.Bool
+ 	ready   chan struct{}
++
++	// runPrefs are the prefs run's Start applied, startFailed says that
++	// Start failed (the backend then has no control client), and callbacks
++	// are run's, for reporting a later failure.
++	runPrefs    *ipn.Prefs
++	startFailed atomic.Bool
++	callbacks   js.Value
+ }
+ 
+ var jsIPNState = map[ipn.State]string{
+@@ -308,6 +315,7 @@ type jsIPN struct {
+ 
+ func (i *jsIPN) run(jsCallbacks js.Value) {
+ 	i.started.Store(true)
++	i.callbacks = jsCallbacks
+ 	notifyState := func(state ipn.State) {
+ 		callLater(jsCallbacks, "notifyState", jsIPNState[state])
+ 	}
+@@ -395,10 +403,12 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
+ 		} else if ip, err := netip.ParseAddr(i.exitNode); err == nil {
+ 			prefs.ExitNodeIP = ip
+ 		}
++		i.runPrefs = prefs.Clone()
+ 		err := i.lb.Start(ipn.Options{
+ 			UpdatePrefs: prefs,
+ 			AuthKey:     i.authKey,
+ 		})
++		i.startFailed.Store(err != nil)
+ 		close(i.ready)
+ 		if err != nil {
+ 			// A Start that fails (a stateStorage that throws, say) leaves
+@@ -426,7 +436,7 @@ func (i *jsIPN) login() {
+ 	}
+ 	go func() {
+ 		<-i.ready
+-		if !i.enforcePrefs("login") {
++		if !i.restartIfFailed() || !i.enforcePrefs("login") {
+ 			return
+ 		}
+ 		i.lb.StartLoginInteractive(context.Background())
+-- 
+2.54.0 (Apple Git-157)
+

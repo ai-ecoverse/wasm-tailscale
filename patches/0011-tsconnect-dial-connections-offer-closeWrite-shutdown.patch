@@ -1,0 +1,41 @@
+From 7ac88f079f259b70d18616dd7cde99c7966a77d1 Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Fri, 9 Oct 2026 20:28:22 +0200
+Subject: [PATCH] tsconnect: dial connections offer closeWrite (shutdown
+ SHUT_WR)
+
+---
+ cmd/tsconnect/wasm/slicc_js.go | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/cmd/tsconnect/wasm/slicc_js.go b/cmd/tsconnect/wasm/slicc_js.go
+index 3467215d3..f7489c117 100644
+--- a/cmd/tsconnect/wasm/slicc_js.go
++++ b/cmd/tsconnect/wasm/slicc_js.go
+@@ -287,7 +287,7 @@ func (i *jsIPN) fetch2(req js.Value) js.Value {
+ //
+ //	dial(network: "tcp" | "udp", addr: "host:port")
+ //	  → Promise<{ localAddr, remoteAddr, read(): Promise<Uint8Array|null>,
+-//	              write(Uint8Array): Promise<number>, close() }>
++//	              write(Uint8Array): Promise<number>, closeWrite(), close() }>
+ func (i *jsIPN) dial(network, addr string) js.Value {
+ 	return promise(func() (any, error) {
+ 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+@@ -310,6 +310,14 @@ func (i *jsIPN) dial(network, addr string) js.Value {
+ 					return n, err
+ 				})
+ 			}),
++			"closeWrite": s.fn(func([]js.Value) any {
++				if cw, ok := conn.(interface{ CloseWrite() error }); ok {
++					if err := cw.CloseWrite(); err != nil {
++						log.Printf("closeWrite: %v", err)
++					}
++				}
++				return nil
++			}),
+ 			"close": s.fn(func([]js.Value) any {
+ 				s.close()
+ 				s.release()
+-- 
+2.54.0 (Apple Git-157)
+
