@@ -1,0 +1,48 @@
+From 3a764834d24602b6372a22ad14ac548c5c7e6117 Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Fri, 9 Oct 2026 21:43:14 +0200
+Subject: [PATCH] tsconnect: select a named exit node by its address, since an
+ ExitNodeID set through EditPrefs comes back empty
+
+---
+ cmd/tsconnect/wasm/slicc_js.go | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/cmd/tsconnect/wasm/slicc_js.go b/cmd/tsconnect/wasm/slicc_js.go
+index 491c7f6db..d8db7fec8 100644
+--- a/cmd/tsconnect/wasm/slicc_js.go
++++ b/cmd/tsconnect/wasm/slicc_js.go
+@@ -28,7 +28,6 @@
+ 	_ "golang.org/x/crypto/x509roots/fallback"
+ 	"tailscale.com/ipn"
+ 	"tailscale.com/ipn/ipnauth"
+-	"tailscale.com/tailcfg"
+ )
+ 
+ const readChunk = 64 * 1024
+@@ -354,8 +353,20 @@ func (i *jsIPN) exitPrefs(expr string) (*ipn.MaskedPrefs, error) {
+ 			if !peer.ExitNodeOption {
+ 				return nil, &jsError{message: expr + " is not an exit node of this tailnet"}
+ 			}
+-			mp.ExitNodeID = tailcfg.StableNodeID(peer.ID)
+-			return mp, nil
++			// Select it by address: an ExitNodeID set through EditPrefs
++			// comes back empty (seen with headscale's numeric stable IDs),
++			// while ExitNodeIP is resolved to the node by the backend.
++			for _, ip := range peer.TailscaleIPs {
++				if ip.Is4() {
++					mp.ExitNodeIP = ip
++					return mp, nil
++				}
++			}
++			if len(peer.TailscaleIPs) > 0 {
++				mp.ExitNodeIP = peer.TailscaleIPs[0]
++				return mp, nil
++			}
++			return nil, &jsError{message: expr + " has no tailnet address"}
+ 		}
+ 	}
+ 	return nil, &jsError{message: "no exit node named " + expr}
+-- 
+2.54.0 (Apple Git-157)
+

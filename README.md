@@ -10,7 +10,7 @@ On top of upstream tsconnect's `run`, `login`, `logout`, `ssh` and `fetch(url)`:
 
 - **`fetch(request)`:** a full HTTP request (method, headers, body) through the tailnet, with a streamed response (`read()` / `cancel()`). `manualRedirects` returns redirects unfollowed. With `encodedBodies` off, Go negotiates gzip and decodes the body. TLS is Go's own, verified against Mozilla's root certificates, which the build embeds because Go has no system roots under `js/wasm`. No CORS applies.
 - **`dial(network, addr)`:** a raw TCP (or UDP) connection with `read()`, `write()`, `closeWrite()` (`shutdown(SHUT_WR)`) and `close()`. Don't use a connection after `close()`: its functions are released about a second later, and calling one then throws "call to released function". Each dial gives up after 30 s.
-- **`setExitNode(expr)`:** `""` for none, `auto:any`, an IP, a MagicDNS name or a stable node ID.
+- **`setExitNode(expr)`:** `""` for none, `auto:any`, an IP, a MagicDNS name or a stable node ID. A name or ID is selected by the node's address, because an `ExitNodeID` set through `EditPrefs` came back empty on headscale.
 - **`status()`:** the backend state, this node, its peers, the exit node, `shieldsUp` and `controlURL`, as JSON. It can be called from the `notify*` callbacks, which the patches deliver on their own JS task. Upstream calls them synchronously from inside Go, where calling back into Go deadlocks js/wasm's single thread. The `stateStorage` callbacks have to stay synchronous, because Go needs `getState`'s answer. Inside them, `status()` returns an `Error` instead of hanging. Defer it there with `setTimeout(…, 0)`. A callback that throws doesn't end the Go program:
   - a throwing `notify*` callback is reported through `notifyPanicRecover`, and the node keeps running;
   - a throwing `stateStorage` callback becomes a storage error inside Go. What follows depends on when it happens:
@@ -49,6 +49,7 @@ node test/throwing-callbacks.mjs # throwing callbacks are survived and reported
 node test/storage-failure.mjs newipn # broken storage: newIPN returns an Error
 node test/login-bursts.mjs healthy  # l,k,l and l,l,k,l login bursts survive
 node test/login-bursts.mjs failed-start # the same after a failed start, then a URL once storage recovers
+HEADSCALE=… TAILSCALED=… TAILSCALE=… node test/local-tailnet.mjs # a tailnet of its own: join, dial a peer, half-close, nothing inbound, exit node by name and ID
 node test/storage-failure.mjs start  # broken storage during run(): reported, login() retries, works once storage recovers
 node test/logout-check.mjs # interactive: join, logout, login again; prints sign-in links to /tmp/logout-check.out
 ```

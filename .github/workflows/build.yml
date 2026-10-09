@@ -27,6 +27,15 @@ jobs:
           node test/storage-failure.mjs start
           node test/login-bursts.mjs healthy
           node test/login-bursts.mjs failed-start
+      - name: A local tailnet (headscale and two userspace tailscaled)
+        timeout-minutes: 5
+        run: |
+          mkdir -p "$RUNNER_TEMP/tailnet" && cd "$RUNNER_TEMP/tailnet"
+          curl -fsSL -o headscale https://github.com/juanfont/headscale/releases/download/v0.29.4/headscale_0.29.4_linux_amd64
+          chmod +x headscale
+          curl -fsSL https://pkgs.tailscale.com/stable/tailscale_1.104.1_amd64.tgz | tar -xz --strip-components=1
+          cd "$GITHUB_WORKSPACE"
+          HEADSCALE="$RUNNER_TEMP/tailnet/headscale" TAILSCALED="$RUNNER_TEMP/tailnet/tailscaled" TAILSCALE="$RUNNER_TEMP/tailnet/tailscale" node test/local-tailnet.mjs
       - name: Pack
         run: |
           cp README.md LICENSE package/
