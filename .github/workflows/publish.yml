@@ -63,4 +63,4 @@ jobs:
           set -e
           if [ "$gate" -eq 10 ]; then exit 0; fi
           if [ "$gate" -ne 0 ]; then exit "$gate"; fi
-          npm publish "$RUNNER_TEMP/certified.tgz" --access public --provenance
+          npm publish "$RUNNER_TEMP/certified.tgz" --access public --provenance --tag latest
