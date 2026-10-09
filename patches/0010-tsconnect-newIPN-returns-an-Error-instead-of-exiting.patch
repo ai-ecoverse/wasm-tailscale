@@ -1,0 +1,84 @@
+From d5a17c4b2d7b39e709644b37231e0122a1ab26fc Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Fri, 9 Oct 2026 19:57:08 +0200
+Subject: [PATCH] tsconnect: newIPN returns an Error instead of exiting when
+ the backend can't be built; a failed start is reported through
+ notifyPanicRecover
+
+---
+ cmd/tsconnect/wasm/slicc_js.go |  8 ++++++++
+ cmd/tsconnect/wasm/wasm_js.go  | 13 ++++++++-----
+ 2 files changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/cmd/tsconnect/wasm/slicc_js.go b/cmd/tsconnect/wasm/slicc_js.go
+index 0c37045f4..3467215d3 100644
+--- a/cmd/tsconnect/wasm/slicc_js.go
++++ b/cmd/tsconnect/wasm/slicc_js.go
+@@ -527,3 +527,11 @@ func callLater(target js.Value, method string, args ...any) {
+ 	})
+ 	js.Global().Call("setTimeout", f, 0)
+ }
++
++// newIPNError is what newIPN returns instead of ending the Go program when
++// the backend can't be built, for example because stateStorage threw.
++func newIPNError(step string, err error) js.Value {
++	message := fmt.Sprintf("newIPN: %s: %v", step, err)
++	log.Print(message)
++	return js.Global().Get("Error").New(message)
++}
+diff --git a/cmd/tsconnect/wasm/wasm_js.go b/cmd/tsconnect/wasm/wasm_js.go
+index 9b642e093..afa6d4841 100644
+--- a/cmd/tsconnect/wasm/wasm_js.go
++++ b/cmd/tsconnect/wasm/wasm_js.go
+@@ -62,7 +62,7 @@ func main() {
+ 	<-make(chan bool)
+ }
+ 
+-func newIPN(jsConfig js.Value) map[string]any {
++func newIPN(jsConfig js.Value) any {
+ 	netns.SetEnabled(false)
+ 
+ 	var store ipn.StateStore
+@@ -134,13 +134,13 @@ func newIPN(jsConfig js.Value) map[string]any {
+ 		EventBus:      sys.Bus.Get(),
+ 	})
+ 	if err != nil {
+-		log.Fatal(err)
++		return newIPNError("wgengine.NewUserspaceEngine", err)
+ 	}
+ 	sys.Set(eng)
+ 
+ 	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), dialer, sys.DNSManager.Get(), sys.ProxyMapper())
+ 	if err != nil {
+-		log.Fatalf("netstack.Create: %v", err)
++		return newIPNError("netstack.Create", err)
+ 	}
+ 	sys.Set(ns)
+ 	ns.ProcessLocalIPs = true
+@@ -176,10 +176,10 @@ func newIPN(jsConfig js.Value) map[string]any {
+ 	srv := ipnserver.New(logf, logid, sys.Bus.Get(), sys.NetMon.Get())
+ 	lb, err := ipnlocal.NewLocalBackend(logf, logid, sys, loginFlags)
+ 	if err != nil {
+-		log.Fatalf("ipnlocal.NewLocalBackend: %v", err)
++		return newIPNError("ipnlocal.NewLocalBackend", err)
+ 	}
+ 	if err := ns.Start(lb); err != nil {
+-		log.Fatalf("failed to start netstack: %v", err)
++		return newIPNError("netstack.Start", err)
+ 	}
+ 	srv.SetLocalBackend(lb)
+ 
+@@ -401,7 +401,10 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
+ 		})
+ 		close(i.ready)
+ 		if err != nil {
++			// A Start that fails (a stateStorage that throws, say) leaves
++			// the backend in NoState; tell the page instead of only logging.
+ 			log.Printf("Start error: %v", err)
++			callLater(jsCallbacks, "notifyPanicRecover", fmt.Sprintf("Tailscale could not start: %v", err))
+ 		}
+ 	}()
+ 
+-- 
+2.54.0 (Apple Git-157)
+

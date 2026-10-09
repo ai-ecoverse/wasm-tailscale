@@ -23,6 +23,8 @@ jobs:
           node test/smoke.mjs
           node test/empty-control-url.mjs
           node test/throwing-callbacks.mjs
+          node test/storage-failure.mjs newipn
+          node test/storage-failure.mjs start
       - name: Pack
         run: |
           cp README.md LICENSE package/

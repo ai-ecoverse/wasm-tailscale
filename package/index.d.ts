@@ -3,7 +3,8 @@ declare global {
     importObject: WebAssembly.Imports;
     run(instance: WebAssembly.Instance): Promise<void>;
   }
-  function newIPN(config: IPNConfig): IPN;
+  /** An Error instead of a node when the backend can't be built (for example, stateStorage threw). */
+  function newIPN(config: IPNConfig): IPN | Error;
 }
 
 export interface IPNConfig {
@@ -28,6 +29,7 @@ export interface IPNCallbacks {
   notifyState(state: string): void;
   notifyNetMap(netMap: string): void;
   notifyBrowseToURL(url: string): void;
+  /** A callback that threw, or "Tailscale could not start: …" when run()'s start failed. */
   notifyPanicRecover(error: string): void;
 }
 
