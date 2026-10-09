@@ -1,0 +1,91 @@
+From f9af71e5a21463fee539cfaa461ca81bd9301dae Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Fri, 9 Oct 2026 19:18:24 +0200
+Subject: [PATCH] tsconnect: a notify or stateStorage callback that throws no
+ longer ends the Go program
+
+---
+ cmd/tsconnect/wasm/slicc_js.go | 23 +++++++++++++++++++++--
+ cmd/tsconnect/wasm/wasm_js.go  |  9 ++++++---
+ 2 files changed, 27 insertions(+), 5 deletions(-)
+
+diff --git a/cmd/tsconnect/wasm/slicc_js.go b/cmd/tsconnect/wasm/slicc_js.go
+index 076e9f1dd..0c37045f4 100644
+--- a/cmd/tsconnect/wasm/slicc_js.go
++++ b/cmd/tsconnect/wasm/slicc_js.go
+@@ -12,6 +12,7 @@
+ 	"crypto/tls"
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"log"
+ 	"net"
+@@ -489,10 +490,18 @@ func (i *jsIPN) enforcePrefs(why string) bool {
+ 
+ const errStatusInCallback = "status() called from inside a stateStorage callback; defer it, for example with setTimeout(…, 0)"
+ 
+-func callJS(target js.Value, method string, args ...any) js.Value {
++// callJS calls a synchronous JS callback. A callback that throws comes back
++// as an error, so a storage failure is a storage error, not a dead module.
++func callJS(target js.Value, method string, args ...any) (result js.Value, err error) {
+ 	inCallback.Add(1)
+ 	defer inCallback.Add(-1)
+-	return target.Call(method, args...)
++	defer func() {
++		if r := recover(); r != nil {
++			err = fmt.Errorf("stateStorage.%s threw: %v", method, r)
++			log.Print(err)
++		}
++	}()
++	return target.Call(method, args...), nil
+ }
+ 
+ // callLater delivers a notify callback on its own JS task, never inside a
+@@ -503,6 +512,16 @@ func callLater(target js.Value, method string, args ...any) {
+ 	var f js.Func
+ 	f = js.FuncOf(func(js.Value, []js.Value) any {
+ 		defer f.Release()
++		// A callback that throws must not end the Go program: report it
++		// through notifyPanicRecover (unless that is what threw) and go on.
++		defer func() {
++			if r := recover(); r != nil {
++				log.Printf("%s threw: %v", method, r)
++				if method != "notifyPanicRecover" {
++					callLater(target, "notifyPanicRecover", fmt.Sprint(r))
++				}
++			}
++		}()
+ 		target.Call(method, args...)
+ 		return nil
+ 	})
+diff --git a/cmd/tsconnect/wasm/wasm_js.go b/cmd/tsconnect/wasm/wasm_js.go
+index ab0c0b1c0..9b642e093 100644
+--- a/cmd/tsconnect/wasm/wasm_js.go
++++ b/cmd/tsconnect/wasm/wasm_js.go
+@@ -670,7 +670,10 @@ type jsStateStore struct {
+ }
+ 
+ func (s *jsStateStore) ReadState(id ipn.StateKey) ([]byte, error) {
+-	jsValue := callJS(s.jsStateStorage, "getState", string(id))
++	jsValue, err := callJS(s.jsStateStorage, "getState", string(id))
++	if err != nil {
++		return nil, err
++	}
+ 	if jsValue.String() == "" {
+ 		return nil, ipn.ErrStateNotExist
+ 	}
+@@ -678,8 +681,8 @@ func (s *jsStateStore) ReadState(id ipn.StateKey) ([]byte, error) {
+ }
+ 
+ func (s *jsStateStore) WriteState(id ipn.StateKey, bs []byte) error {
+-	callJS(s.jsStateStorage, "setState", string(id), hex.EncodeToString(bs))
+-	return nil
++	_, err := callJS(s.jsStateStorage, "setState", string(id), hex.EncodeToString(bs))
++	return err
+ }
+ 
+ func mapSlice[T any, M any](a []T, f func(T) M) []M {
+-- 
+2.54.0 (Apple Git-157)
+

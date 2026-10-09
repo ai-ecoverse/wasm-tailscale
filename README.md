@@ -11,7 +11,9 @@ On top of upstream tsconnect's `run`, `login`, `logout`, `ssh` and `fetch(url)`:
 - **`fetch(request)`:** a full HTTP request (method, headers, body) through the tailnet, with a streamed response (`read()` / `cancel()`). `manualRedirects` returns redirects unfollowed. With `encodedBodies` off, Go negotiates gzip and decodes the body. TLS is Go's own, verified against Mozilla's root certificates, which the build embeds because Go has no system roots under `js/wasm`. No CORS applies.
 - **`dial(network, addr)`:** a raw TCP (or UDP) connection with `read()`, `write()` and `close()`. Each dial gives up after 30 s.
 - **`setExitNode(expr)`:** `""` for none, `auto:any`, an IP, a MagicDNS name or a stable node ID.
-- **`status()`:** the backend state, this node, its peers, the exit node, `shieldsUp` and `controlURL`, as JSON. It can be called from the `notify*` callbacks, which the patches deliver on their own JS task. Upstream calls them synchronously from inside Go, where calling back into Go deadlocks js/wasm's single thread. The `stateStorage` callbacks have to stay synchronous, because Go needs `getState`'s answer. Inside them, `status()` returns an `Error` instead of hanging. Defer it there with `setTimeout(…, 0)`.
+- **`status()`:** the backend state, this node, its peers, the exit node, `shieldsUp` and `controlURL`, as JSON. It can be called from the `notify*` callbacks, which the patches deliver on their own JS task. Upstream calls them synchronously from inside Go, where calling back into Go deadlocks js/wasm's single thread. The `stateStorage` callbacks have to stay synchronous, because Go needs `getState`'s answer. Inside them, `status()` returns an `Error` instead of hanging. Defer it there with `setTimeout(…, 0)`. A callback that throws doesn't end the Go program:
+  - a throwing `notify*` callback is reported through `notifyPanicRecover`, and the node keeps running;
+  - a throwing `stateStorage` callback becomes a storage error for that one read or write.
 - **`login(authKey)`:** logs in with an auth key that arrives after start, for example one pasted by the user. The key is only an option of that one start; it's never stored. Both `login()` and `login(authKey)` are refused before `run()`, and wait for `run()`'s start to finish.
 - **Configuration:** `newIPN` takes `exitNode`, `ephemeral` (default `true`, as upstream) and `logUpload` (default `false`, so nothing goes to `log.tailscale.com`). An empty `controlURL` means Tailscale's default control server.
 - **Shields up, kept up:** tailnet peers can't open connections to the node. `run()`'s start sets shields up, the configured control server, the hostname and accepted routes. The same prefs are applied again before every login (with or without a key), after `logout()` (which replaces the profile with Tailscale's defaults: shields down, the default control server), and whenever a prefs change drops any of them. Logins wait until `run()`'s start has returned.
@@ -40,6 +42,7 @@ Versions are `<tailscale version>-<n>`, for example `1.104.1-1`; `n` counts buil
 ./build.sh          # clones into .build/tailscale, or set TAILSCALE_SRC
 node test/smoke.mjs # reaches Tailscale's control plane, checks shields up and the API
 node test/empty-control-url.mjs # an empty controlURL settles on the default
+node test/throwing-callbacks.mjs # throwing callbacks are survived and reported
 node test/logout-check.mjs # interactive: join, logout, login again; prints sign-in links to /tmp/logout-check.out
 ```
 

@@ -44,6 +44,7 @@ jobs:
         run: |
           node test/smoke.mjs
           node test/empty-control-url.mjs
+          node test/throwing-callbacks.mjs
       - name: Pack a fresh build
         run: |
           cp README.md LICENSE package/

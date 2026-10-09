@@ -1,6 +1,6 @@
 {
   "name": "@ai-ecoverse/wasm-tailscale",
-  "version": "1.104.1-4",
+  "version": "1.104.1-5",
   "description": "Tailscale's tsconnect client (Go, js/wasm) with the APIs SLICC needs to use a tailnet as a network transport: streaming fetch, raw dial, exit nodes, status; shields up",
   "license": "BSD-3-Clause",
   "exports": {

@@ -23,7 +23,7 @@ export interface IPNConfig {
   logUpload?: boolean;
 }
 
-/** Delivered asynchronously, in order, each on its own JS task. */
+/** Delivered asynchronously, in order, each on its own JS task. One that throws is reported through notifyPanicRecover; the node keeps running. */
 export interface IPNCallbacks {
   notifyState(state: string): void;
   notifyNetMap(netMap: string): void;
