@@ -2,3 +2,5 @@
 package/dist/
 *.tgz
 node_modules/
+package/README.md
+package/LICENSE

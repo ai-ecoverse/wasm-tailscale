@@ -1,12 +1,25 @@
 # Publishes @ai-ecoverse/wasm-tailscale with npm trusted publishing (OIDC) and
-# provenance. npm trusts this workflow file by name, so it is not reusable.
+# provenance. It publishes exactly the certified tarball: the `package`
+# artifact of a `build` run, whose sha256 must be `certified`. It also rebuilds
+# from this commit and refuses unless the fresh tarball holds the same files.
+# npm trusts this workflow file by name, so it is not reusable.
 name: publish
 
 on:
   workflow_dispatch:
+    inputs:
+      run:
+        description: id of the `build` run whose `package` artifact was certified
+        required: true
+        type: string
+      certified:
+        description: sha256 of that certified tarball (ai-ecoverse-wasm-tailscale-<version>.tgz)
+        required: true
+        type: string
 
 permissions:
   contents: read
+  actions: read
   id-token: write
 
 jobs:
@@ -17,18 +30,32 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
-      - run: ./build.sh
-      - run: node test/smoke.mjs
-      - name: Publish
+      - name: Fetch the certified tarball
         env:
-          NODE_AUTH_TOKEN: ""
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ inputs.run }}
         run: |
           set -euo pipefail
-          version=$(node -p "require('./package/package.json').version")
-          case "$version" in
-            *-*) ;;
-            *) echo "refuse plain version $version; publish X.Y.Z-N only" >&2; exit 2 ;;
-          esac
+          gh run download "$RUN" --repo "$GITHUB_REPOSITORY" --name package --dir "$RUNNER_TEMP/certified"
+          find "$RUNNER_TEMP/certified" -name '*.tgz' -exec mv {} "$RUNNER_TEMP/certified.tgz" \;
+      - run: ./build.sh
+      - run: node test/smoke.mjs
+      - name: Pack a fresh build
+        run: |
           cp README.md LICENSE package/
-          cd package
-          npm publish --access public --provenance
+          mkdir -p "$RUNNER_TEMP/fresh"
+          cd package && npm pack --pack-destination "$RUNNER_TEMP/fresh"
+      - name: Publish the certified tarball
+        env:
+          NODE_AUTH_TOKEN: ""
+          CERTIFIED: ${{ inputs.certified }}
+        run: |
+          set -euo pipefail
+          set +e
+          node scripts/assert-certified.mjs "$RUNNER_TEMP/certified.tgz" --certified "$CERTIFIED" \
+            --rebuilt "$(ls "$RUNNER_TEMP"/fresh/*.tgz)"
+          gate=$?
+          set -e
+          if [ "$gate" -eq 10 ]; then exit 0; fi
+          if [ "$gate" -ne 0 ]; then exit "$gate"; fi
+          npm publish "$RUNNER_TEMP/certified.tgz" --access public --provenance

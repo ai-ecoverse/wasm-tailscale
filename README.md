@@ -35,7 +35,7 @@ Versions are `<tailscale version>-<n>`, for example `1.104.1-1`; `n` counts buil
 node test/smoke.mjs # reaches Tailscale's control plane, checks shields up and the API
 ```
 
-The build uses Tailscale's pinned Go toolchain (`./tool/go`), `-trimpath`, `-buildvcs=false` and an empty build ID, so the same tag and patches give the same `main.wasm`.
+The build uses Tailscale's pinned Go toolchain (`./tool/go`), `-trimpath`, `-buildvcs=false` and an empty build ID, so the same tag and patches give the same `main.wasm` on any machine. The packed tarball holds the same files everywhere; only its gzip bytes vary by platform.
 
 ## Updating
 
@@ -43,8 +43,14 @@ To move to a new Tailscale tag, rebase the patch series onto it. In a Tailscale 
 
 ## CI
 
-- **`build`:** runs on every push and pull request. It builds, runs the smoke test, and uploads the packed tarball and `build-info.json`.
-- **`publish`:** run by hand. It builds and publishes with npm trusted publishing (OIDC) and provenance.
+- **`build`:** runs on every push and pull request. It builds, runs the smoke test, and uploads the packed tarball as the `package` artifact, with `build-info.json`.
+- **`publish`:** run by hand, with the id of a `build` run and the sha256 its certification gave. It publishes **that run's tarball, byte for byte**, with npm trusted publishing (OIDC) and provenance. Before it does, it rebuilds from the checked-out commit and runs [`scripts/assert-certified.mjs`](scripts/assert-certified.mjs), which refuses:
+  - a tarball whose sha256 isn't the certified one;
+  - a tarball whose files differ from the fresh build (compared by the uncompressed tar, because gzip's output differs between platforms while the files don't);
+  - links, or entries outside `package/`;
+  - a different package name, or a version that isn't `X.Y.Z-N`.
+
+  A version already on npm is skipped. `scripts/pack.sh` packs locally the way CI does and prints the sha256.
 
 ## License
 
