@@ -30,10 +30,14 @@ jobs:
       - name: A local tailnet (headscale and two userspace tailscaled)
         timeout-minutes: 5
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/tailnet" && cd "$RUNNER_TEMP/tailnet"
           curl -fsSL -o headscale https://github.com/juanfont/headscale/releases/download/v0.29.4/headscale_0.29.4_linux_amd64
+          echo "212ed0a884c0d3541e094c4bebbe94397df6f4e01bd3d7f059c520cb55e0d757  headscale" | sha256sum -c -
           chmod +x headscale
-          curl -fsSL https://pkgs.tailscale.com/stable/tailscale_1.104.1_amd64.tgz | tar -xz --strip-components=1
+          curl -fsSL -o tailscale.tgz https://pkgs.tailscale.com/stable/tailscale_1.104.1_amd64.tgz
+          echo "108d1d96ecf410d305571e173516f27038f870919a9b89c914a167c6d33a4528  tailscale.tgz" | sha256sum -c -
+          tar -xzf tailscale.tgz --strip-components=1
           cd "$GITHUB_WORKSPACE"
           HEADSCALE="$RUNNER_TEMP/tailnet/headscale" TAILSCALED="$RUNNER_TEMP/tailnet/tailscaled" TAILSCALE="$RUNNER_TEMP/tailnet/tailscale" node test/local-tailnet.mjs
       - name: Pack
