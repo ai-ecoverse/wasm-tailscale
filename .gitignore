@@ -1,0 +1,4 @@
+.build/
+package/dist/
+*.tgz
+node_modules/

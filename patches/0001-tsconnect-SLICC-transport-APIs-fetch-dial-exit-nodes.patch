@@ -1,0 +1,583 @@
+From 91d453890beafc89d435f620c3f10a814b02daa2 Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Fri, 9 Oct 2026 12:50:23 +0200
+Subject: [PATCH 1/4] tsconnect: SLICC transport APIs (fetch, dial, exit nodes,
+ status)
+
+---
+ cmd/tsconnect/wasm/slicc_js.go            | 414 ++++++++++++++++++++++
+ cmd/tsconnect/wasm/wasm_js.go             |  58 ++-
+ cmd/tsconnect/wasmbuild/printtags/main.go |   9 +
+ cmd/tsconnect/wasmbuild/wasmbuild.go      |   4 +
+ 4 files changed, 477 insertions(+), 8 deletions(-)
+ create mode 100644 cmd/tsconnect/wasm/slicc_js.go
+ create mode 100644 cmd/tsconnect/wasmbuild/printtags/main.go
+
+diff --git a/cmd/tsconnect/wasm/slicc_js.go b/cmd/tsconnect/wasm/slicc_js.go
+new file mode 100644
+index 000000000..0740d8f96
+--- /dev/null
++++ b/cmd/tsconnect/wasm/slicc_js.go
+@@ -0,0 +1,414 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++// SLICC additions to the tsconnect wasm module: a full HTTP fetch, raw
++// TCP/UDP dial, exit-node selection and status, so that a browser kernel can
++// use a tailnet (and its exit nodes) as a network transport.
++
++package main
++
++import (
++	"context"
++	"crypto/tls"
++	"encoding/json"
++	"errors"
++	"io"
++	"net"
++	"net/http"
++	"net/netip"
++	"strconv"
++	"strings"
++	"sync"
++	"syscall/js"
++	"time"
++
++	_ "golang.org/x/crypto/x509roots/fallback"
++	"tailscale.com/ipn"
++	"tailscale.com/ipn/ipnauth"
++	"tailscale.com/tailcfg"
++)
++
++const readChunk = 64 * 1024
++
++func (i *jsIPN) httpClient(manualRedirects, encodedBodies bool) *http.Client {
++	i.clientsMu.Lock()
++	defer i.clientsMu.Unlock()
++	key := [2]bool{manualRedirects, encodedBodies}
++	if c, ok := i.clients[key]; ok {
++		return c
++	}
++	transport := &http.Transport{
++		DialContext:           i.dialer.UserDial,
++		ForceAttemptHTTP2:     true,
++		DisableCompression:    encodedBodies,
++		TLSHandshakeTimeout:   30 * time.Second,
++		ResponseHeaderTimeout: 0,
++		IdleConnTimeout:       90 * time.Second,
++		MaxIdleConnsPerHost:   8,
++		TLSClientConfig:       &tls.Config{},
++	}
++	c := &http.Client{Transport: transport}
++	if manualRedirects {
++		c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
++	}
++	if i.clients == nil {
++		i.clients = map[[2]bool]*http.Client{}
++	}
++	i.clients[key] = c
++	return c
++}
++
++func bytesFromJS(v js.Value) []byte {
++	if v.IsUndefined() || v.IsNull() {
++		return nil
++	}
++	b := make([]byte, v.Get("byteLength").Int())
++	js.CopyBytesToGo(b, v)
++	return b
++}
++
++func bytesToJS(b []byte) js.Value {
++	arr := js.Global().Get("Uint8Array").New(len(b))
++	js.CopyBytesToJS(arr, b)
++	return arr
++}
++
++func headersToJS(h http.Header) []any {
++	out := []any{}
++	for name, values := range h {
++		for _, v := range values {
++			out = append(out, []any{strings.ToLower(name), v})
++		}
++	}
++	return out
++}
++
++type jsError struct {
++	message string
++	code    string
++	status  int
++}
++
++func (e *jsError) Error() string { return e.message }
++
++func classify(err error) error {
++	var je *jsError
++	if errors.As(err, &je) {
++		return je
++	}
++	msg := err.Error()
++	code := ""
++	switch {
++	case errors.Is(err, context.Canceled):
++		code = "ECANCELED"
++	case errors.Is(err, context.DeadlineExceeded), strings.Contains(msg, "timeout"):
++		code = "ETIMEDOUT"
++	case strings.Contains(msg, "connection refused"):
++		code = "ECONNREFUSED"
++	case strings.Contains(msg, "no such host"), strings.Contains(msg, "server misbehaving"):
++		code = "ENOTFOUND"
++	case strings.Contains(msg, "unreachable"), strings.Contains(msg, "no route"):
++		code = "ENETUNREACH"
++	}
++	return &jsError{message: msg, code: code, status: 502}
++}
++
++// promise is like makePromise but rejects with an Error that carries a
++// code and status, which the kernel's transport bridge passes on.
++func promise(f func() (any, error)) js.Value {
++	handler := js.FuncOf(func(this js.Value, args []js.Value) any {
++		resolve := args[0]
++		reject := args[1]
++		go func() {
++			res, err := f()
++			if err == nil {
++				resolve.Invoke(res)
++				return
++			}
++			je := classify(err).(*jsError)
++			e := js.Global().Get("Error").New(je.message)
++			if je.code != "" {
++				e.Set("code", je.code)
++			}
++			if je.status != 0 {
++				e.Set("status", je.status)
++			}
++			reject.Invoke(e)
++		}()
++		return nil
++	})
++	return js.Global().Get("Promise").New(handler)
++}
++
++type jsStream struct {
++	mu     sync.Mutex
++	cancel context.CancelFunc
++	body   io.ReadCloser
++	conn   net.Conn
++	funcs  []js.Func
++}
++
++func (s *jsStream) fn(f func(args []js.Value) any) js.Func {
++	jf := js.FuncOf(func(this js.Value, args []js.Value) any { return f(args) })
++	s.funcs = append(s.funcs, jf)
++	return jf
++}
++
++func (s *jsStream) release() {
++	s.mu.Lock()
++	funcs := s.funcs
++	s.funcs = nil
++	s.mu.Unlock()
++	go func() {
++		time.Sleep(time.Second)
++		for _, f := range funcs {
++			f.Release()
++		}
++	}()
++}
++
++func (s *jsStream) read(r io.Reader) js.Value {
++	return promise(func() (any, error) {
++		buf := make([]byte, readChunk)
++		for {
++			n, err := r.Read(buf)
++			if n > 0 {
++				return bytesToJS(buf[:n]), nil
++			}
++			if err == io.EOF {
++				s.close()
++				return js.Null(), nil
++			}
++			if err != nil {
++				s.close()
++				return nil, err
++			}
++		}
++	})
++}
++
++func (s *jsStream) close() {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.cancel != nil {
++		s.cancel()
++		s.cancel = nil
++	}
++	if s.body != nil {
++		s.body.Close()
++		s.body = nil
++	}
++	if s.conn != nil {
++		s.conn.Close()
++		s.conn = nil
++	}
++}
++
++// fetch2 performs one HTTP request over the tailnet:
++//
++//	fetch2({ url, method, headers: [[name, value]], body?: Uint8Array,
++//	         manualRedirects?: bool, encodedBodies?: bool })
++//	  → Promise<{ status, statusText, url, headers, read(): Promise<Uint8Array|null>, cancel() }>
++//
++// With encodedBodies false, the request's Accept-Encoding is replaced by Go's
++// own gzip negotiation and the body arrives decoded, without
++// Content-Encoding; with manualRedirects false, redirects are followed.
++func (i *jsIPN) fetch2(req js.Value) js.Value {
++	return promise(func() (any, error) {
++		manual := req.Get("manualRedirects").Truthy()
++		encoded := req.Get("encodedBodies").Truthy()
++		method := "GET"
++		if m := req.Get("method"); m.Type() == js.TypeString {
++			method = m.String()
++		}
++		var body io.Reader
++		if b := bytesFromJS(req.Get("body")); b != nil {
++			body = strings.NewReader(string(b))
++		}
++		ctx, cancel := context.WithCancel(context.Background())
++		hr, err := http.NewRequestWithContext(ctx, method, req.Get("url").String(), body)
++		if err != nil {
++			cancel()
++			return nil, &jsError{message: err.Error(), status: 400}
++		}
++		if hs := req.Get("headers"); !hs.IsUndefined() {
++			for n := 0; n < hs.Length(); n++ {
++				pair := hs.Index(n)
++				name := pair.Index(0).String()
++				value := pair.Index(1).String()
++				switch strings.ToLower(name) {
++				case "host":
++					hr.Host = value
++				case "content-length", "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
++				case "accept-encoding":
++					if encoded {
++						hr.Header.Add(name, value)
++					}
++				default:
++					hr.Header.Add(name, value)
++				}
++			}
++		}
++		res, err := i.httpClient(manual, encoded).Do(hr)
++		if err != nil {
++			cancel()
++			return nil, err
++		}
++		s := &jsStream{cancel: cancel, body: res.Body}
++		if !encoded && res.Uncompressed {
++			res.Header.Del("Content-Encoding")
++			res.Header.Del("Content-Length")
++		}
++		return map[string]any{
++			"status":     res.StatusCode,
++			"statusText": strings.TrimSpace(strings.TrimPrefix(res.Status, strconv.Itoa(res.StatusCode))),
++			"url":        res.Request.URL.String(),
++			"headers":    headersToJS(res.Header),
++			"read": s.fn(func([]js.Value) any {
++				return s.read(res.Body)
++			}),
++			"cancel": s.fn(func([]js.Value) any {
++				s.close()
++				s.release()
++				return nil
++			}),
++		}, nil
++	})
++}
++
++// dial opens a raw connection over the tailnet (or through its exit node):
++//
++//	dial(network: "tcp" | "udp", addr: "host:port")
++//	  → Promise<{ localAddr, remoteAddr, read(): Promise<Uint8Array|null>,
++//	              write(Uint8Array): Promise<number>, close() }>
++func (i *jsIPN) dial(network, addr string) js.Value {
++	return promise(func() (any, error) {
++		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++		defer cancel()
++		conn, err := i.dialer.UserDial(ctx, network, addr)
++		if err != nil {
++			return nil, err
++		}
++		s := &jsStream{conn: conn}
++		return map[string]any{
++			"localAddr":  conn.LocalAddr().String(),
++			"remoteAddr": conn.RemoteAddr().String(),
++			"read": s.fn(func([]js.Value) any {
++				return s.read(conn)
++			}),
++			"write": s.fn(func(args []js.Value) any {
++				b := bytesFromJS(args[0])
++				return promise(func() (any, error) {
++					n, err := conn.Write(b)
++					return n, err
++				})
++			}),
++			"close": s.fn(func([]js.Value) any {
++				s.close()
++				s.release()
++				return nil
++			}),
++		}, nil
++	})
++}
++
++// exitPrefs turns an exit-node expression into masked prefs: "" clears the
++// exit node, "auto:any" (or any auto: expression) picks one automatically,
++// an IP selects that node, and anything else is matched against peer names
++// and stable IDs.
++func (i *jsIPN) exitPrefs(expr string) (*ipn.MaskedPrefs, error) {
++	mp := &ipn.MaskedPrefs{ExitNodeIDSet: true, ExitNodeIPSet: true, AutoExitNodeSet: true}
++	expr = strings.TrimSpace(expr)
++	if expr == "" {
++		return mp, nil
++	}
++	if auto, ok := ipn.ParseAutoExitNodeString(expr); ok {
++		mp.AutoExitNode = auto
++		return mp, nil
++	}
++	if ip, err := netip.ParseAddr(expr); err == nil {
++		mp.ExitNodeIP = ip
++		return mp, nil
++	}
++	st := i.lb.Status()
++	want := strings.ToLower(strings.TrimSuffix(expr, "."))
++	for _, peer := range st.Peer {
++		dns := strings.ToLower(strings.TrimSuffix(peer.DNSName, "."))
++		short, _, _ := strings.Cut(dns, ".")
++		if string(peer.ID) == expr || dns == want || short == want || strings.ToLower(peer.HostName) == want {
++			if !peer.ExitNodeOption {
++				return nil, &jsError{message: expr + " is not an exit node of this tailnet"}
++			}
++			mp.ExitNodeID = tailcfg.StableNodeID(peer.ID)
++			return mp, nil
++		}
++	}
++	return nil, &jsError{message: "no exit node named " + expr}
++}
++
++func (i *jsIPN) setExitNode(expr string) js.Value {
++	return promise(func() (any, error) {
++		mp, err := i.exitPrefs(expr)
++		if err != nil {
++			return nil, err
++		}
++		if _, err := i.lb.EditPrefsAs(mp, ipnauth.Self); err != nil {
++			return nil, err
++		}
++		return nil, nil
++	})
++}
++
++type jsPeerStatus struct {
++	ID             string   `json:"id"`
++	Name           string   `json:"name"`
++	DNSName        string   `json:"dnsName"`
++	Addresses      []string `json:"addresses"`
++	Online         bool     `json:"online"`
++	ExitNode       bool     `json:"exitNode"`
++	ExitNodeOption bool     `json:"exitNodeOption"`
++}
++
++type jsStatus struct {
++	State        string         `json:"state"`
++	Self         *jsPeerStatus  `json:"self,omitempty"`
++	MagicDNS     string         `json:"magicDNSSuffix,omitempty"`
++	ExitNode     *jsPeerStatus  `json:"exitNode,omitempty"`
++	AutoExitNode string         `json:"autoExitNode,omitempty"`
++	Peers        []jsPeerStatus `json:"peers"`
++}
++
++func (i *jsIPN) status() string {
++	st := i.lb.Status()
++	out := jsStatus{State: st.BackendState, MagicDNS: st.MagicDNSSuffix, Peers: []jsPeerStatus{}}
++	addrs := func(ips []netip.Addr) []string {
++		s := make([]string, len(ips))
++		for n, ip := range ips {
++			s[n] = ip.String()
++		}
++		return s
++	}
++	if st.Self != nil {
++		out.Self = &jsPeerStatus{
++			ID: string(st.Self.ID), Name: st.Self.HostName, DNSName: st.Self.DNSName,
++			Addresses: addrs(st.Self.TailscaleIPs), Online: st.Self.Online,
++		}
++	}
++	for _, peer := range st.Peer {
++		p := jsPeerStatus{
++			ID: string(peer.ID), Name: peer.HostName, DNSName: peer.DNSName,
++			Addresses: addrs(peer.TailscaleIPs), Online: peer.Online,
++			ExitNode: peer.ExitNode, ExitNodeOption: peer.ExitNodeOption,
++		}
++		if peer.ExitNode {
++			cp := p
++			out.ExitNode = &cp
++		}
++		out.Peers = append(out.Peers, p)
++	}
++	if prefs := i.lb.Prefs(); prefs.Valid() {
++		out.AutoExitNode = string(prefs.AutoExitNode())
++	}
++	b, _ := json.Marshal(out)
++	return string(b)
++}
+diff --git a/cmd/tsconnect/wasm/wasm_js.go b/cmd/tsconnect/wasm/wasm_js.go
+index 480b2c6b5..1b02f0322 100644
+--- a/cmd/tsconnect/wasm/wasm_js.go
++++ b/cmd/tsconnect/wasm/wasm_js.go
+@@ -21,6 +21,7 @@
+ 	"net/http"
+ 	"net/netip"
+ 	"strings"
++	"sync"
+ 	"syscall/js"
+ 	"time"
+ 
+@@ -80,6 +81,16 @@ func newIPN(jsConfig js.Value) map[string]any {
+ 		authKey = jsAuthKey.String()
+ 	}
+ 
++	var exitNode string
++	if jsExitNode := jsConfig.Get("exitNode"); jsExitNode.Type() == js.TypeString {
++		exitNode = jsExitNode.String()
++	}
++
++	loginFlags := controlclient.LoginEphemeral
++	if jsEphemeral := jsConfig.Get("ephemeral"); jsEphemeral.Type() == js.TypeBoolean && !jsEphemeral.Bool() {
++		loginFlags = controlclient.LoginDefault
++	}
++
+ 	var hostname string
+ 	if jsHostname := jsConfig.Get("hostname"); jsHostname.Type() == js.TypeString {
+ 		hostname = jsHostname.String()
+@@ -155,7 +166,7 @@ func newIPN(jsConfig js.Value) map[string]any {
+ 
+ 	logid := lpc.PublicID
+ 	srv := ipnserver.New(logf, logid, sys.Bus.Get(), sys.NetMon.Get())
+-	lb, err := ipnlocal.NewLocalBackend(logf, logid, sys, controlclient.LoginEphemeral)
++	lb, err := ipnlocal.NewLocalBackend(logf, logid, sys, loginFlags)
+ 	if err != nil {
+ 		log.Fatalf("ipnlocal.NewLocalBackend: %v", err)
+ 	}
+@@ -171,6 +182,7 @@ func newIPN(jsConfig js.Value) map[string]any {
+ 		controlURL: controlURL,
+ 		authKey:    authKey,
+ 		hostname:   hostname,
++		exitNode:   exitNode,
+ 	}
+ 
+ 	return map[string]any{
+@@ -219,9 +231,29 @@ func newIPN(jsConfig js.Value) map[string]any {
+ 				return nil
+ 			}
+ 
++			if args[0].Type() == js.TypeObject {
++				return jsIPN.fetch2(args[0])
++			}
+ 			url := args[0].String()
+ 			return jsIPN.fetch(url)
+ 		}),
++		"dial": js.FuncOf(func(this js.Value, args []js.Value) any {
++			if len(args) != 2 {
++				log.Printf("Usage: dial(network, addr)")
++				return nil
++			}
++			return jsIPN.dial(args[0].String(), args[1].String())
++		}),
++		"setExitNode": js.FuncOf(func(this js.Value, args []js.Value) any {
++			expr := ""
++			if len(args) > 0 && args[0].Type() == js.TypeString {
++				expr = args[0].String()
++			}
++			return jsIPN.setExitNode(expr)
++		}),
++		"status": js.FuncOf(func(this js.Value, args []js.Value) any {
++			return jsIPN.status()
++		}),
+ 	}
+ }
+ 
+@@ -232,6 +264,10 @@ type jsIPN struct {
+ 	controlURL string
+ 	authKey    string
+ 	hostname   string
++	exitNode   string
++
++	clientsMu sync.Mutex
++	clients   map[[2]bool]*http.Client
+ }
+ 
+ var jsIPNState = map[ipn.State]string{
+@@ -324,14 +360,20 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
+ 	})
+ 
+ 	go func() {
++		prefs := &ipn.Prefs{
++			ControlURL:  i.controlURL,
++			RouteAll:    true,
++			WantRunning: true,
++			Hostname:    i.hostname,
++		}
++		if auto, ok := ipn.ParseAutoExitNodeString(i.exitNode); ok {
++			prefs.AutoExitNode = auto
++		} else if ip, err := netip.ParseAddr(i.exitNode); err == nil {
++			prefs.ExitNodeIP = ip
++		}
+ 		err := i.lb.Start(ipn.Options{
+-			UpdatePrefs: &ipn.Prefs{
+-				ControlURL:  i.controlURL,
+-				RouteAll:    false,
+-				WantRunning: true,
+-				Hostname:    i.hostname,
+-			},
+-			AuthKey: i.authKey,
++			UpdatePrefs: prefs,
++			AuthKey:     i.authKey,
+ 		})
+ 		if err != nil {
+ 			log.Printf("Start error: %v", err)
+diff --git a/cmd/tsconnect/wasmbuild/printtags/main.go b/cmd/tsconnect/wasmbuild/printtags/main.go
+new file mode 100644
+index 000000000..94ef8043d
+--- /dev/null
++++ b/cmd/tsconnect/wasmbuild/printtags/main.go
+@@ -0,0 +1,9 @@
++package main
++
++import (
++	"fmt"
++
++	"tailscale.com/cmd/tsconnect/wasmbuild"
++)
++
++func main() { fmt.Print(wasmbuild.Tags()) }
+diff --git a/cmd/tsconnect/wasmbuild/wasmbuild.go b/cmd/tsconnect/wasmbuild/wasmbuild.go
+index 1b927f15e..4a055c144 100644
+--- a/cmd/tsconnect/wasmbuild/wasmbuild.go
++++ b/cmd/tsconnect/wasmbuild/wasmbuild.go
+@@ -56,6 +56,10 @@
+ 	"ipnbus",   // notification bus for state/netmap callbacks
+ 	"logtail",  // log upload (browser console + remote)
+ 	"netstack", // userspace networking; wasm has no kernel TUN
++
++	"useexitnode",   // SLICC: route internet traffic through a tailnet exit node
++	"peerapiclient", // SLICC: DNS over the exit node's peerapi DoH
++	"useroutes",     // SLICC: reach subnet routes
+ }
+ 
+ func init() {
+-- 
+2.54.0 (Apple Git-157)
+

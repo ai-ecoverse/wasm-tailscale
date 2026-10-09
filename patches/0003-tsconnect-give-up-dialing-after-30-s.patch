@@ -1,0 +1,29 @@
+From d8754b8473508a19c0fdf7772367a4a75f0f135b Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Fri, 9 Oct 2026 16:22:09 +0200
+Subject: [PATCH 3/4] tsconnect: give up dialing after 30 s
+
+---
+ cmd/tsconnect/wasm/slicc_js.go | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/cmd/tsconnect/wasm/slicc_js.go b/cmd/tsconnect/wasm/slicc_js.go
+index 51ec78bf8..22d15d948 100644
+--- a/cmd/tsconnect/wasm/slicc_js.go
++++ b/cmd/tsconnect/wasm/slicc_js.go
+@@ -39,7 +39,11 @@ func (i *jsIPN) httpClient(manualRedirects, encodedBodies bool) *http.Client {
+ 		return c
+ 	}
+ 	transport := &http.Transport{
+-		DialContext:           i.dialer.UserDial,
++		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
++			ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
++			defer cancel()
++			return i.dialer.UserDial(ctx, network, addr)
++		},
+ 		ForceAttemptHTTP2:     true,
+ 		DisableCompression:    encodedBodies,
+ 		TLSHandshakeTimeout:   30 * time.Second,
+-- 
+2.54.0 (Apple Git-157)
+

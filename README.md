@@ -1,0 +1,51 @@
+# wasm-tailscale
+
+[Tailscale](https://github.com/tailscale/tailscale)'s browser client, tsconnect (Go compiled to `js/wasm`), with the APIs [SLICC](https://github.com/ai-ecoverse/slicc-bios) needs to use a tailnet as a network transport. It's published as [`@ai-ecoverse/wasm-tailscale`](https://www.npmjs.com/package/@ai-ecoverse/wasm-tailscale).
+
+This repo holds no Tailscale source. It pins a Tailscale tag in [`upstream.json`](upstream.json) and keeps SLICC's changes as a readable patch series in [`patches/`](patches/). [`build.sh`](build.sh) clones the tag, checks the commit, applies the patches and builds `package/dist/`.
+
+## What the patches add
+
+On top of upstream tsconnect's `run`, `login`, `logout`, `ssh` and `fetch(url)`:
+
+- **`fetch(request)`:** a full HTTP request (method, headers, body) through the tailnet, with a streamed response (`read()` / `cancel()`). `manualRedirects` returns redirects unfollowed. With `encodedBodies` off, Go negotiates gzip and decodes the body. TLS is Go's own, verified against Mozilla's root certificates, which the build embeds because Go has no system roots under `js/wasm`. No CORS applies.
+- **`dial(network, addr)`:** a raw TCP (or UDP) connection with `read()`, `write()` and `close()`. Each dial gives up after 30 s.
+- **`setExitNode(expr)`:** `""` for none, `auto:any`, an IP, a MagicDNS name or a stable node ID.
+- **`status()`:** the backend state, this node, its peers, the exit node and `shieldsUp`, as JSON.
+- **`login(authKey)`:** logs in with an auth key that arrives after start, for example one pasted by the user. The key is only an option of that one start; it's never stored.
+- **Configuration:** `newIPN` takes `exitNode`, `ephemeral` (default `true`, as upstream) and `logUpload` (default `false`, so nothing goes to `log.tailscale.com`).
+- **Shields up on every start:** tailnet peers can't open connections to the node.
+- **Build features:** the build keeps `useexitnode`, `peerapiclient` (DNS through the exit node) and `useroutes`. Everything that serves peers (peerapi server, serve, ssh server, taildrop, drive) stays compiled out, as in upstream's wasm build.
+
+## The package
+
+- `dist/main.wasm`: about 30 MB, 4.7 MB with brotli.
+- `dist/wasm_exec.js`: from the same Go toolchain.
+- `dist/build-info.json`: the Tailscale tag and commit, the Go version, the sha256 of every patch and file.
+- `index.d.ts`: the API above.
+
+To load it, run `wasm_exec.js` (it defines `globalThis.Go`), instantiate `main.wasm` with `new Go().importObject`, call `go.run(instance)`, and wait for `globalThis.newIPN`. `newIPN` is a single global per JavaScript realm, so run it in its own worker.
+
+Versions are `<tailscale version>-<n>`, for example `1.104.1-1`; `n` counts builds of the same tag.
+
+## Build
+
+```sh
+./build.sh          # clones into .build/tailscale, or set TAILSCALE_SRC
+node test/smoke.mjs # reaches Tailscale's control plane, checks shields up and the API
+```
+
+The build uses Tailscale's pinned Go toolchain (`./tool/go`), `-trimpath`, `-buildvcs=false` and an empty build ID, so the same tag and patches give the same `main.wasm`.
+
+## Updating
+
+To move to a new Tailscale tag, rebase the patch series onto it. In a Tailscale clone, apply `patches/*.patch` to the old tag with `git am`, rebase onto the new tag, then refresh `patches/` with `git format-patch <new-tag>..HEAD`. Update `upstream.json`, and set `package/package.json`'s version to `<new version>-1`.
+
+## CI
+
+- **`build`:** runs on every push and pull request. It builds, runs the smoke test, and uploads the packed tarball and `build-info.json`.
+- **`publish`:** run by hand. It builds and publishes with npm trusted publishing (OIDC) and provenance.
+
+## License
+
+BSD 3-Clause, as Tailscale's (see [LICENSE](LICENSE)). The patches are under the same license.

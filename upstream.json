@@ -1,0 +1,5 @@
+{
+  "repository": "https://github.com/tailscale/tailscale",
+  "tag": "v1.104.1",
+  "commit": "9a522a9786c97eb7910c01ccb7bd66557b04c910"
+}

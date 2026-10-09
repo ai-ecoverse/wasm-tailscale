@@ -1,0 +1,22 @@
+{
+  "name": "@ai-ecoverse/wasm-tailscale",
+  "version": "1.104.1-1",
+  "description": "Tailscale's tsconnect client (Go, js/wasm) with the APIs SLICC needs to use a tailnet as a network transport: streaming fetch, raw dial, exit nodes, status; shields up",
+  "license": "BSD-3-Clause",
+  "exports": {
+    "./main.wasm": "./dist/main.wasm",
+    "./wasm_exec.js": "./dist/wasm_exec.js",
+    "./build-info.json": "./dist/build-info.json",
+    "./package.json": "./package.json"
+  },
+  "types": "./index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ai-ecoverse/wasm-tailscale.git",
+    "directory": "package"
+  },
+  "homepage": "https://github.com/ai-ecoverse/wasm-tailscale",
+  "keywords": ["wasm", "tailscale", "tsconnect", "slicc", "wireguard"],
+  "files": ["README.md", "LICENSE", "index.d.ts", "dist"],
+  "publishConfig": { "access": "public", "provenance": true }
+}

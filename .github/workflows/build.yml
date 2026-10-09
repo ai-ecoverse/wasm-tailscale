@@ -1,0 +1,31 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Build from the pinned tag and the patches
+        run: ./build.sh
+      - name: Smoke test (control plane, shields up, API)
+        run: node test/smoke.mjs
+      - name: Pack
+        run: |
+          cp README.md LICENSE package/
+          cd package && npm pack --pack-destination "$RUNNER_TEMP"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: package
+          path: |
+            ${{ runner.temp }}/*.tgz
+            package/dist/build-info.json
