@@ -52,11 +52,11 @@ const { name, version } = JSON.parse(execFileSync('tar', ['-xOzf', tgz, 'package
 if (name !== NAME) refuse(`tarball is ${name}, not ${NAME}`);
 if (!/^\d+\.\d+\.\d+-\d+$/.test(version)) refuse(`version ${version} is not X.Y.Z-N`);
 
+if (sha256 !== certified) refuse(`tarball sha256 ${sha256} is not the certified ${certified}`);
 const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(NAME)}/${version}`);
 if (response.status === 200) {
   console.log(`${NAME}@${version} is already on npm; nothing to publish`);
   process.exit(10);
 }
 if (response.status !== 404) refuse(`npm registry answered ${response.status} for ${version}`);
-if (sha256 !== certified) refuse(`tarball sha256 ${sha256} is not the certified ${certified}`);
 console.log(`certified: publishing ${NAME}@${version}`);

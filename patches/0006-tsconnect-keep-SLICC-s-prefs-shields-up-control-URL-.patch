@@ -1,0 +1,153 @@
+From f41a21036c5753e1ae6f2a660ae7891d2898186a Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Fri, 9 Oct 2026 18:21:31 +0200
+Subject: [PATCH] tsconnect: keep SLICC's prefs (shields up, control URL,
+ hostname, routes) through logout, login and any prefs change; logins wait for
+ run's start
+
+---
+ cmd/tsconnect/wasm/slicc_js.go | 40 +++++++++++++++++++++++++++++++---
+ cmd/tsconnect/wasm/wasm_js.go  | 20 +++++++++++++++--
+ 2 files changed, 55 insertions(+), 5 deletions(-)
+
+diff --git a/cmd/tsconnect/wasm/slicc_js.go b/cmd/tsconnect/wasm/slicc_js.go
+index addc8e021..970291093 100644
+--- a/cmd/tsconnect/wasm/slicc_js.go
++++ b/cmd/tsconnect/wasm/slicc_js.go
+@@ -381,6 +381,7 @@ type jsStatus struct {
+ 	ExitNode     *jsPeerStatus  `json:"exitNode,omitempty"`
+ 	AutoExitNode string         `json:"autoExitNode,omitempty"`
+ 	ShieldsUp    bool           `json:"shieldsUp"`
++	ControlURL   string         `json:"controlURL,omitempty"`
+ 	Peers        []jsPeerStatus `json:"peers"`
+ }
+ 
+@@ -415,6 +416,7 @@ func (i *jsIPN) status() string {
+ 	if prefs := i.lb.Prefs(); prefs.Valid() {
+ 		out.AutoExitNode = string(prefs.AutoExitNode())
+ 		out.ShieldsUp = prefs.ShieldsUp()
++		out.ControlURL = prefs.ControlURL()
+ 	}
+ 	b, _ := json.Marshal(out)
+ 	return string(b)
+@@ -433,15 +435,47 @@ func (i *jsIPN) loginWithKey(authKey string) {
+ 		return
+ 	}
+ 	go func() {
++		<-i.ready
++		if !i.enforcePrefs("login with key") {
++			return
++		}
+ 		if err := i.lb.Start(ipn.Options{AuthKey: authKey}); err != nil {
+ 			log.Printf("Start with auth key: %v", err)
+ 			return
+ 		}
+-		shields := &ipn.MaskedPrefs{Prefs: ipn.Prefs{ShieldsUp: true}, ShieldsUpSet: true}
+-		if _, err := i.lb.EditPrefsAs(shields, ipnauth.Self); err != nil {
+-			log.Printf("shields up: %v", err)
++		if !i.enforcePrefs("login with key") {
+ 			return
+ 		}
+ 		i.lb.StartLoginInteractive(context.Background())
+ 	}()
+ }
++
++// prefsDrifted reports whether prefs lost what SLICC requires of the node:
++// shields up, the configured control server, the hostname and accepted
++// routes. A profile change (logout, a reused stateStorage) starts from
++// ipn.NewPrefs, which has none of them.
++func (i *jsIPN) prefsDrifted(p ipn.PrefsView) bool {
++	return !p.ShieldsUp() || p.ControlURL() != i.controlURL || p.Hostname() != i.hostname || !p.RouteAll()
++}
++
++// enforcePrefs puts SLICC's required prefs back; it is called before every
++// login, after logout, and whenever a prefs notification shows them drifted.
++func (i *jsIPN) enforcePrefs(why string) bool {
++	mp := &ipn.MaskedPrefs{
++		Prefs: ipn.Prefs{
++			ShieldsUp:  true,
++			ControlURL: i.controlURL,
++			Hostname:   i.hostname,
++			RouteAll:   true,
++		},
++		ShieldsUpSet:  true,
++		ControlURLSet: true,
++		HostnameSet:   true,
++		RouteAllSet:   true,
++	}
++	if _, err := i.lb.EditPrefsAs(mp, ipnauth.Self); err != nil {
++		log.Printf("%s: enforcing prefs: %v", why, err)
++		return false
++	}
++	return true
++}
+diff --git a/cmd/tsconnect/wasm/wasm_js.go b/cmd/tsconnect/wasm/wasm_js.go
+index 137928d70..1003b4cb7 100644
+--- a/cmd/tsconnect/wasm/wasm_js.go
++++ b/cmd/tsconnect/wasm/wasm_js.go
+@@ -186,6 +186,7 @@ func newIPN(jsConfig js.Value) map[string]any {
+ 		authKey:    authKey,
+ 		hostname:   hostname,
+ 		exitNode:   exitNode,
++		ready:      make(chan struct{}),
+ 	}
+ 
+ 	return map[string]any{
+@@ -273,8 +274,10 @@ type jsIPN struct {
+ 	clients   map[[2]bool]*http.Client
+ 
+ 	// started is set by run, whose Start applies SLICC's prefs (shields up);
+-	// login before run is refused so no Start runs on stored prefs.
++	// login before run is refused so no Start runs on stored prefs. ready is
++	// closed once run's Start has returned; logins wait for it.
+ 	started atomic.Bool
++	ready   chan struct{}
+ }
+ 
+ var jsIPNState = map[ipn.State]string{
+@@ -313,6 +316,9 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
+ 			}
+ 		}()
+ 		log.Printf("NOTIFY: %+v", n)
++		if n.Prefs != nil && n.Prefs.Valid() && i.prefsDrifted(*n.Prefs) {
++			go i.enforcePrefs("prefs changed")
++		}
+ 		if n.State != nil {
+ 			notifyState(*n.State)
+ 		}
+@@ -384,6 +390,7 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
+ 			UpdatePrefs: prefs,
+ 			AuthKey:     i.authKey,
+ 		})
++		close(i.ready)
+ 		if err != nil {
+ 			log.Printf("Start error: %v", err)
+ 		}
+@@ -405,7 +412,13 @@ func (i *jsIPN) login() {
+ 		log.Printf("login: refused before run")
+ 		return
+ 	}
+-	go i.lb.StartLoginInteractive(context.Background())
++	go func() {
++		<-i.ready
++		if !i.enforcePrefs("login") {
++			return
++		}
++		i.lb.StartLoginInteractive(context.Background())
++	}()
+ }
+ 
+ func (i *jsIPN) logout() {
+@@ -416,6 +429,9 @@ func (i *jsIPN) logout() {
+ 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+ 		defer cancel()
+ 		i.lb.Logout(ctx, ipnauth.Self)
++		// Logout deletes the profile, and the new one starts from
++		// ipn.NewPrefs: shields down, the default control server.
++		i.enforcePrefs("logout")
+ 	}()
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

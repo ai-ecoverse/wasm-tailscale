@@ -21,7 +21,7 @@ const listed = execFileSync(
 const goroot = execFileSync(go, ['env', 'GOROOT'], { cwd: src, env, encoding: 'utf8' }).trim();
 const goversion = execFileSync(go, ['env', 'GOVERSION'], { cwd: src, env, encoding: 'utf8' }).trim();
 
-const NOTICE = /^(LICEN[CS]E|COPYING|NOTICE|PATENTS|AUTHORS|COPYRIGHT)([._-][^.]*)?(\.(txt|md|rst))?$/i;
+const NOTICE = /^(LICEN[CS]E|COPYING|NOTICE|PATENTS|AUTHORS|COPYRIGHT)(-[a-z0-9]+)?(\.(txt|md|rst))?$/i;
 const modules = new Map();
 for (const line of listed.split('\n').filter(Boolean)) {
   const parts = line.split('\t');
@@ -37,10 +37,17 @@ for (const line of listed.split('\n').filter(Boolean)) {
   }
 }
 
+const LICENCE = /^(LICEN[CS]E|COPYING)(-[a-z0-9]+)?(\.(txt|md|rst))?$/i;
 const sorted = [...modules.values()].sort((a, b) => a.path.localeCompare(b.path));
-const missing = sorted.filter((m) => m.files.size === 0).map((m) => m.path);
+const missing = sorted
+  .filter((m) => ![...m.files].some((file) => LICENCE.test(file.split(sep).pop())))
+  .map((m) => m.path);
 if (missing.length) {
-  console.error(`no licence file found for: ${missing.join(', ')}`);
+  console.error(`no LICENSE, LICENCE or COPYING file for: ${missing.join(', ')}`);
+  process.exit(1);
+}
+if (!existsSync(join(goroot, 'LICENSE'))) {
+  console.error(`no LICENSE in the Go toolchain at ${goroot}`);
   process.exit(1);
 }
 const fence = (text) => {

@@ -53,7 +53,7 @@ export interface IPNConn {
  */
 export interface IPN {
   run(callbacks: IPNCallbacks): void;
-  /** Refused before run(). With a key, shields are set up again before logging in. */
+  /** Refused before run(); waits for run()'s start, and re-applies shields up, the control URL, hostname and routes first. */
   login(authKey?: string): void;
   logout(): void;
   fetch(request: {
@@ -66,5 +66,6 @@ export interface IPN {
   }): Promise<IPNResponse>;
   dial(network: 'tcp' | 'udp', addr: string): Promise<IPNConn>;
   setExitNode(expr: string): Promise<void>;
+  /** JSON. Don't call it synchronously inside notifyState/notifyNetMap: that can deadlock. */
   status(): string;
 }
