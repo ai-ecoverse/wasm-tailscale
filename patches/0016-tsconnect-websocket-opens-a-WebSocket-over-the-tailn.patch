@@ -1,21 +1,21 @@
-From 01046c87bd0d456b08b593c439f72bb99e48f13f Mon Sep 17 00:00:00 2001
+From 8c65a576f5954e6953f050bd6dd9ecb3d1eece33 Mon Sep 17 00:00:00 2001
 From: Lars Trieloff <lars@trieloff.net>
 Date: Thu, 15 Oct 2026 10:44:49 +0200
 Subject: [PATCH 16/16] tsconnect: websocket() opens a WebSocket over the
  tailnet, with Go's WebSocket on the IPN's dialer
 
 ---
- cmd/tsconnect/wasm/slicc_websocket_js.go | 610 +++++++++++++++++++++++
+ cmd/tsconnect/wasm/slicc_websocket_js.go | 649 +++++++++++++++++++++++
  cmd/tsconnect/wasm/wasm_js.go            |   8 +
- 2 files changed, 618 insertions(+)
+ 2 files changed, 657 insertions(+)
  create mode 100644 cmd/tsconnect/wasm/slicc_websocket_js.go
 
 diff --git a/cmd/tsconnect/wasm/slicc_websocket_js.go b/cmd/tsconnect/wasm/slicc_websocket_js.go
 new file mode 100644
-index 0000000..5b9ba27
+index 0000000..20aa9a4
 --- /dev/null
 +++ b/cmd/tsconnect/wasm/slicc_websocket_js.go
-@@ -0,0 +1,610 @@
+@@ -0,0 +1,649 @@
 +// Copyright (c) Tailscale Inc & contributors
 +// SPDX-License-Identifier: BSD-3-Clause
 +
@@ -77,7 +77,10 @@ index 0000000..5b9ba27
 +}
 +
 +type jsWebSocket struct {
-+	conn     *websocket.Conn
++	conn *websocket.Conn
++	// buffered is read without mu (by the buffered getter) but only
++	// changed with mu held, so a reset at abort or close isn't undone by
++	// the write that was in flight.
 +	buffered atomic.Int64
 +
 +	mu         sync.Mutex
@@ -89,6 +92,8 @@ index 0000000..5b9ba27
 +	drained    bool // messages has said done (or return() was called)
 +	discard    bool // return() was called: drop what arrives
 +	sendq      []wsOut
++	inflight   int                // bytes of the write in progress, still counted in buffered
++	stopWrite  context.CancelFunc // cancels the write in progress
 +	closeCode  websocket.StatusCode
 +	closeWhy   string
 +	closing    bool          // the writer has started the close handshake
@@ -239,7 +244,10 @@ index 0000000..5b9ba27
 +// connection ended without one.
 +//
 +// signal aborts the handshake (the promise rejects with signal.reason) and
-+// closes an open socket with 1001. Any object with aborted, reason and
++// closes an open socket with 1001: what send queued is dropped, and a write
++// in progress is cancelled, which tears the connection down (closed then
++// settles with 1006), since a peer that stops reading could otherwise hold
++// the close back forever. Any object with aborted, reason and
 +// addEventListener("abort", …) will do.
 +//
 +// Once closed has settled and messages has said done (or return() was
@@ -291,7 +299,7 @@ index 0000000..5b9ba27
 +		ws.onAbort = js.FuncOf(func(js.Value, []js.Value) any {
 +			aborted.Store(true)
 +			cancel()
-+			ws.close(int(websocket.StatusGoingAway), "the request was aborted")
++			ws.abort()
 +			return nil
 +		})
 +		signal.Call("addEventListener", "abort", ws.onAbort, map[string]any{"once": true})
@@ -453,6 +461,29 @@ index 0000000..5b9ba27
 +	ws.cond.Broadcast()
 +}
 +
++// abort is the signal's abort on an open socket: what send queued is
++// dropped, a write in progress is cancelled (which tears the connection
++// down, since a write the peer doesn't read could block forever), and a
++// close frame with 1001 is sent if the connection is still up. closed
++// settles with 1006 when it wasn't.
++func (ws *jsWebSocket) abort() {
++	ws.mu.Lock()
++	defer ws.mu.Unlock()
++	if ws.conn == nil || ws.state != wsOpen {
++		return
++	}
++	ws.state = wsClosing
++	ws.closeCode = websocket.StatusGoingAway
++	ws.closeWhy = "the request was aborted"
++	ws.sendq = []wsOut{{close: true}}
++	ws.inflight = 0
++	ws.buffered.Store(0)
++	if ws.stopWrite != nil {
++		ws.stopWrite()
++	}
++	ws.cond.Broadcast()
++}
++
 +// next is messages.next(). Calls are answered in the order they were made.
 +func (ws *jsWebSocket) next() js.Value {
 +	p, resolve, _ := jsPromise()
@@ -524,20 +555,27 @@ index 0000000..5b9ba27
 +		out := ws.sendq[0]
 +		ws.sendq[0] = wsOut{}
 +		ws.sendq = ws.sendq[1:]
++		code, reason := ws.closeCode, ws.closeWhy
 +		if out.close {
 +			ws.closing = true
-+		}
-+		code, reason := ws.closeCode, ws.closeWhy
-+		ws.mu.Unlock()
-+		if out.close {
++			ws.mu.Unlock()
 +			// Close writes the frame, waits (up to 5 s) for the peer's, and
 +			// closes the connection, which ends readLoop.
 +			ws.closeErr = ws.conn.Close(code, reason)
 +			close(ws.closeDone)
 +			return
 +		}
-+		err := ws.conn.Write(context.Background(), out.typ, out.data)
-+		ws.buffered.Add(-int64(len(out.data)))
++		ctx, stop := context.WithCancel(context.Background())
++		ws.inflight = len(out.data)
++		ws.stopWrite = stop
++		ws.mu.Unlock()
++		err := ws.conn.Write(ctx, out.typ, out.data)
++		ws.mu.Lock()
++		ws.buffered.Add(-int64(ws.inflight))
++		ws.inflight = 0
++		ws.stopWrite = nil
++		ws.mu.Unlock()
++		stop()
 +		if err != nil {
 +			ws.conn.CloseNow()
 +			return
@@ -571,6 +609,7 @@ index 0000000..5b9ba27
 +	ws.state = wsClosed
 +	ws.ended = true
 +	ws.sendq = nil
++	ws.inflight = 0
 +	ws.buffered.Store(0)
 +	ws.cond.Broadcast()
 +	ws.mu.Unlock()

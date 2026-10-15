@@ -109,7 +109,8 @@ function wsClosePayload(code, reason) {
 }
 
 // A WebSocket echo server, written out here so the test needs no package.
-// GET /refuse answers 403 and /slow takes 5 s to answer. It picks the
+// GET /refuse answers 403, /slow takes 5 s to answer, and /deaf never reads
+// what it's sent and drops the connection after 4 s. It picks the
 // subprotocol chat.v2 when offered, and echoes every message, except for a
 // few text commands: "headers" sends the handshake's headers as JSON,
 // "close-me" closes with 4001 "server bye", "ping-me" pings and answers
@@ -145,7 +146,10 @@ function wsServer(port) {
           '',
         ].join('\r\n')
       );
-      wsServe(socket, req);
+      if (path === '/deaf') {
+        socket.pause();
+        setTimeout(() => socket.destroy(), 4000);
+      } else wsServe(socket, req);
     };
     setTimeout(answer, path === '/slow' ? 5000 : 0);
   });

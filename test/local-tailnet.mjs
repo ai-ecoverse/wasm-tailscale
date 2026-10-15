@@ -163,6 +163,26 @@ try {
   const aborted = await ipn.websocket({ url: `${base}/echo`, signal: live.signal });
   live.abort();
   assert.deepEqual(await aborted.closed, { code: 1001, reason: 'the request was aborted' }, 'abort closes an open socket');
+  // A peer that stops reading: sends stall, abort still closes, and buffered
+  // drops to 0 and stays there, whether abort or the connection ends it.
+  const stall = async (signal) => {
+    const ws = await ipn.websocket({ url: `${base}/deaf`, signal });
+    for (let n = 0; n < 8; n++) ws.send(new Uint8Array(8 * 1024 * 1024));
+    await wait(2500);
+    assert.ok(ws.buffered > 0, `a deaf peer leaves bytes unsent (${ws.buffered})`);
+    return ws;
+  };
+  const stuck = new AbortController();
+  const deaf = await stall(stuck.signal);
+  stuck.abort();
+  assert.equal(deaf.buffered, 0, 'abort drops what was queued');
+  assert.equal((await deaf.closed).code, 1006, 'abort gets past a stalled write, tearing the connection down');
+  await wait(500);
+  assert.equal(deaf.buffered, 0);
+  const dropped = await stall();
+  assert.equal((await dropped.closed).code, 1006, 'the peer dropping the connection ends a stalled socket');
+  await wait(500);
+  assert.equal(dropped.buffered, 0, 'buffered stays 0 after the stalled write fails');
   const huge = await ipn.websocket({ url: `${base}/echo` });
   assert.equal(huge.send(new Uint8Array(64 * 1024 * 1024 + 1)).code, 'EMSGSIZE');
   assert.equal((await huge.closed).code, 1009, 'sending over 64 MiB closes with 1009');
