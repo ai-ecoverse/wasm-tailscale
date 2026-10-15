@@ -48,7 +48,7 @@ function browsed(url) {
   assert.match(insideStorage.message, /called from inside a stateStorage callback/);
   assert.equal(status.shieldsUp, true, 'shields up after a login that was attempted before run');
   assert.equal(status.controlURL, CONTROL);
-  for (const name of ['fetch', 'dial', 'setExitNode', 'status', 'login'])
+  for (const name of ['fetch', 'dial', 'websocket', 'setExitNode', 'status', 'login'])
     assert.equal(typeof ipn[name], 'function', name);
   ipn.logout();
   setTimeout(() => {
