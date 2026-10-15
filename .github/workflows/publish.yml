@@ -32,7 +32,7 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: '24.21.0'
       - name: Fetch the certified tarball
@@ -85,7 +85,7 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: '24.21.0'
       - uses: actions/download-artifact@v5
