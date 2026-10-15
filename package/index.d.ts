@@ -53,6 +53,43 @@ export interface IPNConn {
   close(): void;
 }
 
+export interface IPNWebSocketRequest {
+  /** ws:, wss:, http: or https:. wss: is verified against the bundled roots. */
+  url: string;
+  protocols?: string[] | string;
+  /** Sent with the handshake, except Host, Connection, Upgrade, Sec-WebSocket-*, Cookie and the other hop-by-hop headers. */
+  headers?: [string, string][];
+  /** Cancels the handshake (rejecting with signal.reason) and closes an open socket with 1001. */
+  signal?: AbortSignal;
+}
+
+export interface IPNWebSocketClose {
+  code: number;
+  reason: string;
+}
+
+/**
+ * Go's WebSocket over the tailnet, in the shape of the kernel's
+ * RealmWebSocket, except that send() returns an Error instead of throwing.
+ * Once `closed` has settled and `messages` has ended, its functions become
+ * plain JS stand-ins and Go's are released a second later: don't keep
+ * references to them past that.
+ */
+export interface IPNWebSocket {
+  /** The subprotocol the server chose, or "". */
+  readonly protocol: string;
+  /** Bytes given to send() and not yet written. */
+  readonly buffered: number;
+  /** An Error with code EPIPE once closing, or EMSGSIZE over 64 MiB (which also closes with 1009). */
+  send(data: string | Uint8Array | ArrayBuffer): undefined | Error;
+  /** Whole messages: strings for text, Uint8Arrays for binary. return() drops what's left. */
+  readonly messages: AsyncIterableIterator<string | Uint8Array>;
+  /** A code a client can't send becomes 1000; the reason is cut to 123 bytes at a UTF-8 boundary. */
+  close(code?: number, reason?: string): void;
+  /** The close frame that ended the socket; 1005 without a code, 1006 without a close frame. */
+  readonly closed: Promise<IPNWebSocketClose>;
+}
+
 /**
  * A node with shields up (peers can't connect to it) that accepts subnet
  * routes: RouteAll is true, unlike upstream tsconnect, so traffic to a route
@@ -72,6 +109,8 @@ export interface IPN {
     encodedBodies?: boolean;
   }): Promise<IPNResponse>;
   dial(network: 'tcp' | 'udp', addr: string): Promise<IPNConn>;
+  /** A refused handshake rejects with an Error whose status is the HTTP status; redirects aren't followed. */
+  websocket(request: IPNWebSocketRequest): Promise<IPNWebSocket>;
   setExitNode(expr: string): Promise<void>;
   /** JSON. Safe in the notify* callbacks (they run on their own task); returns an Error inside stateStorage callbacks instead of hanging. */
   status(): string | Error;

@@ -1,0 +1,650 @@
+From 01046c87bd0d456b08b593c439f72bb99e48f13f Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Thu, 15 Oct 2026 10:44:49 +0200
+Subject: [PATCH 16/16] tsconnect: websocket() opens a WebSocket over the
+ tailnet, with Go's WebSocket on the IPN's dialer
+
+---
+ cmd/tsconnect/wasm/slicc_websocket_js.go | 610 +++++++++++++++++++++++
+ cmd/tsconnect/wasm/wasm_js.go            |   8 +
+ 2 files changed, 618 insertions(+)
+ create mode 100644 cmd/tsconnect/wasm/slicc_websocket_js.go
+
+diff --git a/cmd/tsconnect/wasm/slicc_websocket_js.go b/cmd/tsconnect/wasm/slicc_websocket_js.go
+new file mode 100644
+index 0000000..5b9ba27
+--- /dev/null
++++ b/cmd/tsconnect/wasm/slicc_websocket_js.go
+@@ -0,0 +1,610 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++// websocket(): a WebSocket client over the tailnet, for SLICC's kernel.
++//
++// The handshake and every frame go through the IPN's own dialer, as fetch
++// and dial do, so a public host is reached through the exit node and a
++// tailnet name or address goes to the peer. It's Go's WebSocket
++// (tempfork/coder/websocket, coder/websocket's Go implementation), never the
++// browser's: no browser cookies, no Origin, no CORS.
++
++package main
++
++import (
++	"context"
++	"crypto/tls"
++	"errors"
++	"fmt"
++	"net"
++	"net/http"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"syscall/js"
++	"time"
++	"unicode/utf8"
++
++	websocket "tailscale.com/tempfork/coder/websocket"
++)
++
++const (
++	// wsMaxMessage is the largest message, sent or received; a bigger one
++	// closes the WebSocket with 1009.
++	wsMaxMessage = 64 << 20
++	// wsQueued is how many received bytes wait for messages.next() before
++	// Go stops reading from the peer (back pressure); at least one message
++	// is always held, whatever its size.
++	wsQueued = 16 << 20
++	// wsMaxReason is the longest close reason: a close frame's payload is
++	// at most 125 bytes, two of them the code.
++	wsMaxReason = 123
++)
++
++const (
++	wsOpen = iota
++	wsClosing
++	wsClosed
++)
++
++type wsOut struct {
++	typ   websocket.MessageType
++	data  []byte
++	close bool
++}
++
++type wsIn struct {
++	text bool
++	data []byte
++}
++
++type jsWebSocket struct {
++	conn     *websocket.Conn
++	buffered atomic.Int64
++
++	mu         sync.Mutex
++	cond       *sync.Cond // signals any change below
++	state      int
++	inbox      []wsIn
++	inboxBytes int
++	ended      bool // no message will be added to inbox
++	drained    bool // messages has said done (or return() was called)
++	discard    bool // return() was called: drop what arrives
++	sendq      []wsOut
++	closeCode  websocket.StatusCode
++	closeWhy   string
++	closing    bool          // the writer has started the close handshake
++	closeDone  chan struct{} // closed once that handshake has returned
++	closeErr   error
++	nextTail   chan struct{} // the previous next() call, which this one waits for
++	released   bool
++	resolveEnd js.Value
++	signal     js.Value
++	onAbort    js.Func
++	funcs      []js.Func
++	object     js.Value
++	messages   js.Value
++}
++
++// jsPromise returns a new Promise and its resolve and reject functions.
++func jsPromise() (p, resolve, reject js.Value) {
++	executor := js.FuncOf(func(_ js.Value, args []js.Value) any {
++		resolve, reject = args[0], args[1]
++		return nil
++	})
++	p = js.Global().Get("Promise").New(executor)
++	executor.Release()
++	return p, resolve, reject
++}
++
++// jsErrorValue is the Error that promise() rejects with: a message, and the
++// code and status classify gives.
++func jsErrorValue(err error) js.Value {
++	je := classify(err).(*jsError)
++	e := js.Global().Get("Error").New(je.message)
++	if je.code != "" {
++		e.Set("code", je.code)
++	}
++	if je.status != 0 {
++		e.Set("status", je.status)
++	}
++	return e
++}
++
++// jsConstant returns a plain JS function (not one of Go's, so it is never
++// released) that returns v, whatever it's called with.
++func jsConstant(v js.Value) js.Value {
++	return js.Global().Get("Reflect").Get("get").Call("bind", js.Undefined(), map[string]any{"v": v}, "v")
++}
++
++// abortReason is what a promise rejects with when the signal aborted it.
++func abortReason(signal js.Value) js.Value {
++	if r := signal.Get("reason"); !r.IsUndefined() {
++		return r
++	}
++	e := js.Global().Get("Error").New("the operation was aborted")
++	e.Set("name", "AbortError")
++	e.Set("code", "ECANCELED")
++	return e
++}
++
++// wsSendable is the close code that is sent for code: one a client may
++// send (1000–1003, 1007–1014, 3000–4999), or 1000.
++func wsSendable(code int) websocket.StatusCode {
++	if (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999) {
++		return websocket.StatusCode(code)
++	}
++	return websocket.StatusNormalClosure
++}
++
++// wsReason cuts a close reason to wsMaxReason bytes, at a UTF-8 boundary.
++func wsReason(reason string) string {
++	if len(reason) <= wsMaxReason {
++		return reason
++	}
++	end := wsMaxReason
++	for end > 0 && !utf8.RuneStart(reason[end]) {
++		end--
++	}
++	return reason[:end]
++}
++
++// wsSkipHeader reports whether a handshake header given by the caller is
++// dropped: the ones the WebSocket handshake itself sets (Host, Connection,
++// Upgrade, Sec-WebSocket-*), Cookie, and the other hop-by-hop headers.
++func wsSkipHeader(name string) bool {
++	switch name = strings.ToLower(name); {
++	case strings.HasPrefix(name, "sec-websocket-"):
++		return true
++	case name == "host", name == "connection", name == "upgrade", name == "cookie",
++		name == "content-length", name == "transfer-encoding", name == "keep-alive",
++		name == "proxy-connection", name == "te", name == "trailer":
++		return true
++	}
++	return false
++}
++
++func (i *jsIPN) wsClient() *http.Client {
++	return &http.Client{
++		Transport: &http.Transport{
++			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
++				ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
++				defer cancel()
++				return i.dialer.UserDial(ctx, network, addr)
++			},
++			// HTTP/1.1 only: an HTTP/2 connection can't be upgraded.
++			ForceAttemptHTTP2:   false,
++			TLSClientConfig:     &tls.Config{NextProtos: []string{"http/1.1"}},
++			TLSHandshakeTimeout: 30 * time.Second,
++			DisableCompression:  true,
++			DisableKeepAlives:   true,
++		},
++		// As a browser's WebSocket: a redirect fails the handshake.
++		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
++	}
++}
++
++// websocket opens a WebSocket over the tailnet:
++//
++//	websocket({ url: string, protocols?: string[] | string,
++//	            headers?: [name, value][], signal?: AbortSignal })
++//	  → Promise<{
++//	      protocol: string,          // the subprotocol the server chose, or ""
++//	      readonly buffered: number, // bytes given to send() and not yet written
++//	      send(data: string | Uint8Array | ArrayBuffer): undefined | Error,
++//	      messages: { next(): Promise<{ value: string | Uint8Array, done: false }
++//	                                  | { value: undefined, done: true }>,
++//	                  return(): Promise<{ value: undefined, done: true }>,
++//	                  [Symbol.asyncIterator]() },
++//	      close(code?: number, reason?: string): void,
++//	      closed: Promise<{ code: number, reason: string }>,
++//	    }>
++//
++// url is ws:, wss:, http: or https:. wss: is verified against the bundled
++// roots, as fetch is. headers go into the handshake, except Host,
++// Connection, Upgrade, Sec-WebSocket-*, Cookie and the other hop-by-hop
++// headers. A refused handshake rejects with an Error whose status is the
++// HTTP status (403 and so on); redirects aren't followed.
++//
++// send returns an Error (code EPIPE) instead of throwing once the socket is
++// closing, and (code EMSGSIZE) for a message over 64 MiB, which also closes
++// the socket with 1009. Messages are whole (fragments reassembled), at most
++// 64 MiB (a bigger one closes with 1009), and pings are answered in Go. Only
++// wsQueued (16 MiB) of received messages wait for next(); beyond that Go
++// stops reading, and the peer feels TCP's back pressure.
++//
++// close sends a close frame after what send has queued; a code that a
++// client can't send becomes 1000, and the reason is cut to 123 bytes at a
++// UTF-8 boundary. closed settles with the code and reason of the close frame
++// that ended the socket (the peer's, or the one we sent once the peer
++// acknowledged it), 1005 for a frame without a code, and 1006 when the
++// connection ended without one.
++//
++// signal aborts the handshake (the promise rejects with signal.reason) and
++// closes an open socket with 1001. Any object with aborted, reason and
++// addEventListener("abort", …) will do.
++//
++// Once closed has settled and messages has said done (or return() was
++// called), send, close, buffered and messages are swapped for plain JS
++// stand-ins and Go's functions are released a second later: don't keep
++// references to the original functions past that.
++func (i *jsIPN) websocket(req js.Value) js.Value {
++	p, resolve, reject := jsPromise()
++	signal := req.Get("signal")
++	if signal.Type() != js.TypeObject || signal.Get("addEventListener").Type() != js.TypeFunction {
++		signal = js.Undefined()
++	}
++	if !signal.IsUndefined() && signal.Get("aborted").Truthy() {
++		reject.Invoke(abortReason(signal))
++		return p
++	}
++	u := req.Get("url")
++	if u.Type() != js.TypeString {
++		reject.Invoke(jsErrorValue(&jsError{message: "websocket: url must be a string", status: 400}))
++		return p
++	}
++	opts := &websocket.DialOptions{
++		HTTPClient:      i.wsClient(),
++		HTTPHeader:      http.Header{},
++		CompressionMode: websocket.CompressionDisabled,
++	}
++	switch ps := req.Get("protocols"); ps.Type() {
++	case js.TypeString:
++		opts.Subprotocols = []string{ps.String()}
++	case js.TypeObject:
++		for n := 0; n < ps.Length(); n++ {
++			opts.Subprotocols = append(opts.Subprotocols, ps.Index(n).String())
++		}
++	}
++	if hs := req.Get("headers"); hs.Type() == js.TypeObject {
++		for n := 0; n < hs.Length(); n++ {
++			pair := hs.Index(n)
++			if name := pair.Index(0).String(); !wsSkipHeader(name) {
++				opts.HTTPHeader.Add(name, pair.Index(1).String())
++			}
++		}
++	}
++
++	ctx, cancel := context.WithCancel(context.Background())
++	ws := &jsWebSocket{signal: signal, closeDone: make(chan struct{})}
++	ws.cond = sync.NewCond(&ws.mu)
++	var aborted atomic.Bool
++	if !signal.IsUndefined() {
++		ws.onAbort = js.FuncOf(func(js.Value, []js.Value) any {
++			aborted.Store(true)
++			cancel()
++			ws.close(int(websocket.StatusGoingAway), "the request was aborted")
++			return nil
++		})
++		signal.Call("addEventListener", "abort", ws.onAbort, map[string]any{"once": true})
++	}
++	fail := func(v js.Value) {
++		cancel()
++		ws.unlisten()
++		if ws.onAbort.Truthy() {
++			ws.onAbort.Release()
++		}
++		reject.Invoke(v)
++	}
++	go func() {
++		conn, resp, err := websocket.Dial(ctx, u.String(), opts)
++		switch {
++		case aborted.Load():
++			if conn != nil {
++				conn.CloseNow()
++			}
++			fail(abortReason(signal))
++			return
++		case err != nil && resp != nil && resp.StatusCode != http.StatusSwitchingProtocols:
++			fail(jsErrorValue(&jsError{
++				message: fmt.Sprintf("WebSocket handshake refused: HTTP %s", resp.Status),
++				code:    "EHANDSHAKE",
++				status:  resp.StatusCode,
++			}))
++			return
++		case err != nil:
++			fail(jsErrorValue(err))
++			return
++		}
++		conn.SetReadLimit(wsMaxMessage)
++		ws.mu.Lock()
++		ws.conn = conn
++		ws.mu.Unlock()
++		resolve.Invoke(ws.open())
++		go ws.readLoop()
++		go ws.writeLoop()
++	}()
++	return p
++}
++
++func (ws *jsWebSocket) fn(f func(args []js.Value) any) js.Func {
++	jf := js.FuncOf(func(_ js.Value, args []js.Value) any { return f(args) })
++	ws.funcs = append(ws.funcs, jf)
++	return jf
++}
++
++// open builds the JS object for an open socket.
++func (ws *jsWebSocket) open() js.Value {
++	closed, resolveEnd, _ := jsPromise()
++	ws.resolveEnd = resolveEnd
++	ws.nextTail = make(chan struct{})
++	close(ws.nextTail)
++
++	messages := js.Global().Get("Object").New()
++	messages.Set("next", ws.fn(func([]js.Value) any { return ws.next() }))
++	messages.Set("return", ws.fn(func([]js.Value) any {
++		ws.mu.Lock()
++		ws.discard = true
++		ws.inbox, ws.inboxBytes = nil, 0
++		ws.cond.Broadcast()
++		ws.mu.Unlock()
++		ws.markDrained()
++		return js.Global().Get("Promise").Call("resolve", map[string]any{"value": js.Undefined(), "done": true})
++	}))
++	js.Global().Get("Reflect").Call("set", messages, js.Global().Get("Symbol").Get("asyncIterator"),
++		ws.fn(func([]js.Value) any { return messages }))
++	ws.messages = messages
++
++	obj := js.Global().Get("Object").New()
++	obj.Set("protocol", ws.conn.Subprotocol())
++	js.Global().Get("Object").Call("defineProperty", obj, "buffered", map[string]any{
++		"get":          ws.fn(func([]js.Value) any { return ws.buffered.Load() }),
++		"enumerable":   true,
++		"configurable": true,
++	})
++	obj.Set("send", ws.fn(func(args []js.Value) any {
++		if len(args) == 0 {
++			return js.Global().Get("TypeError").New("send: no data")
++		}
++		return ws.send(args[0])
++	}))
++	obj.Set("messages", messages)
++	obj.Set("close", ws.fn(func(args []js.Value) any {
++		code, reason := int(websocket.StatusNormalClosure), ""
++		if len(args) > 0 && args[0].Type() == js.TypeNumber {
++			code = args[0].Int()
++		}
++		if len(args) > 1 && args[1].Type() == js.TypeString {
++			reason = args[1].String()
++		}
++		ws.close(code, reason)
++		return nil
++	}))
++	obj.Set("closed", closed)
++	ws.object = obj
++	return obj
++}
++
++func wsSendError(message, code string) js.Value {
++	e := js.Global().Get("Error").New(message)
++	e.Set("code", code)
++	return e
++}
++
++func (ws *jsWebSocket) send(v js.Value) js.Value {
++	tooBig := func() js.Value {
++		ws.close(int(websocket.StatusMessageTooBig), "a message over 64 MiB")
++		return wsSendError("a WebSocket message over 64 MiB", "EMSGSIZE")
++	}
++	var out wsOut
++	switch u8 := js.Global().Get("Uint8Array"); {
++	case v.Type() == js.TypeString:
++		out = wsOut{typ: websocket.MessageText, data: []byte(v.String())}
++	case v.Type() == js.TypeObject && js.Global().Get("ArrayBuffer").Call("isView", v).Bool():
++		if v.Get("byteLength").Int() > wsMaxMessage {
++			return tooBig()
++		}
++		if !v.InstanceOf(u8) {
++			v = u8.New(v.Get("buffer"), v.Get("byteOffset"), v.Get("byteLength"))
++		}
++		out = wsOut{typ: websocket.MessageBinary, data: bytesFromJS(v)}
++	case v.Type() == js.TypeObject && v.InstanceOf(js.Global().Get("ArrayBuffer")):
++		if v.Get("byteLength").Int() > wsMaxMessage {
++			return tooBig()
++		}
++		out = wsOut{typ: websocket.MessageBinary, data: bytesFromJS(u8.New(v))}
++	default:
++		return js.Global().Get("TypeError").New("send: a string, Uint8Array or ArrayBuffer")
++	}
++	if len(out.data) > wsMaxMessage {
++		return tooBig()
++	}
++	ws.mu.Lock()
++	defer ws.mu.Unlock()
++	if ws.state != wsOpen {
++		return wsSendError("the WebSocket is closed", "EPIPE")
++	}
++	ws.buffered.Add(int64(len(out.data)))
++	ws.sendq = append(ws.sendq, out)
++	ws.cond.Broadcast()
++	return js.Undefined()
++}
++
++// close queues a close frame after what send has queued; only the first
++// close (or abort) counts.
++func (ws *jsWebSocket) close(code int, reason string) {
++	ws.mu.Lock()
++	defer ws.mu.Unlock()
++	if ws.conn == nil || ws.state != wsOpen {
++		return
++	}
++	ws.state = wsClosing
++	ws.closeCode = wsSendable(code)
++	ws.closeWhy = wsReason(reason)
++	ws.sendq = append(ws.sendq, wsOut{close: true})
++	ws.cond.Broadcast()
++}
++
++// next is messages.next(). Calls are answered in the order they were made.
++func (ws *jsWebSocket) next() js.Value {
++	p, resolve, _ := jsPromise()
++	prev := ws.nextTail
++	mine := make(chan struct{})
++	ws.nextTail = mine
++	go func() {
++		<-prev
++		defer close(mine)
++		ws.mu.Lock()
++		for len(ws.inbox) == 0 && !ws.ended && !ws.discard {
++			ws.cond.Wait()
++		}
++		if len(ws.inbox) == 0 {
++			ws.mu.Unlock()
++			resolve.Invoke(map[string]any{"value": js.Undefined(), "done": true})
++			ws.markDrained()
++			return
++		}
++		m := ws.inbox[0]
++		ws.inbox[0] = wsIn{}
++		ws.inbox = ws.inbox[1:]
++		ws.inboxBytes -= len(m.data)
++		ws.cond.Broadcast()
++		ws.mu.Unlock()
++		var value any
++		if m.text {
++			value = string(m.data)
++		} else {
++			value = bytesToJS(m.data)
++		}
++		resolve.Invoke(map[string]any{"value": value, "done": false})
++	}()
++	return p
++}
++
++func (ws *jsWebSocket) readLoop() {
++	for {
++		ws.mu.Lock()
++		for ws.state == wsOpen && !ws.discard && len(ws.inbox) > 0 && ws.inboxBytes >= wsQueued {
++			ws.cond.Wait()
++		}
++		ws.mu.Unlock()
++		typ, b, err := ws.conn.Read(context.Background())
++		if err != nil {
++			ws.finish(err)
++			return
++		}
++		ws.mu.Lock()
++		if !ws.discard {
++			ws.inbox = append(ws.inbox, wsIn{text: typ == websocket.MessageText, data: b})
++			ws.inboxBytes += len(b)
++			ws.cond.Broadcast()
++		}
++		ws.mu.Unlock()
++	}
++}
++
++func (ws *jsWebSocket) writeLoop() {
++	for {
++		ws.mu.Lock()
++		for len(ws.sendq) == 0 && ws.state != wsClosed {
++			ws.cond.Wait()
++		}
++		if ws.state == wsClosed {
++			ws.mu.Unlock()
++			return
++		}
++		out := ws.sendq[0]
++		ws.sendq[0] = wsOut{}
++		ws.sendq = ws.sendq[1:]
++		if out.close {
++			ws.closing = true
++		}
++		code, reason := ws.closeCode, ws.closeWhy
++		ws.mu.Unlock()
++		if out.close {
++			// Close writes the frame, waits (up to 5 s) for the peer's, and
++			// closes the connection, which ends readLoop.
++			ws.closeErr = ws.conn.Close(code, reason)
++			close(ws.closeDone)
++			return
++		}
++		err := ws.conn.Write(context.Background(), out.typ, out.data)
++		ws.buffered.Add(-int64(len(out.data)))
++		if err != nil {
++			ws.conn.CloseNow()
++			return
++		}
++	}
++}
++
++// finish settles closed once readLoop has ended with err.
++func (ws *jsWebSocket) finish(err error) {
++	code, reason := int(websocket.StatusAbnormalClosure), ""
++	var ce websocket.CloseError
++	switch {
++	case errors.As(err, &ce):
++		code, reason = int(ce.Code), ce.Reason
++	case errors.Is(err, websocket.ErrMessageTooBig):
++		code, reason = int(websocket.StatusMessageTooBig), "a message over 64 MiB"
++	default:
++		// Close itself may have read the peer's answer to our close frame;
++		// it returns nil when the peer answered with the same code.
++		ws.mu.Lock()
++		closing := ws.closing
++		ws.mu.Unlock()
++		if closing {
++			<-ws.closeDone
++			if ws.closeErr == nil {
++				code, reason = int(ws.closeCode), ws.closeWhy
++			}
++		}
++	}
++	ws.mu.Lock()
++	ws.state = wsClosed
++	ws.ended = true
++	ws.sendq = nil
++	ws.buffered.Store(0)
++	ws.cond.Broadcast()
++	ws.mu.Unlock()
++	go ws.conn.CloseNow()
++	ws.unlisten()
++	ws.resolveEnd.Invoke(map[string]any{"code": code, "reason": reason})
++	ws.maybeRelease()
++}
++
++func (ws *jsWebSocket) unlisten() {
++	if !ws.signal.IsUndefined() && ws.onAbort.Truthy() {
++		ws.signal.Call("removeEventListener", "abort", ws.onAbort)
++	}
++}
++
++func (ws *jsWebSocket) markDrained() {
++	ws.mu.Lock()
++	ws.drained = true
++	ws.mu.Unlock()
++	ws.maybeRelease()
++}
++
++// maybeRelease swaps the object's functions for plain JS stand-ins and
++// releases Go's, once closed has settled and messages has ended.
++func (ws *jsWebSocket) maybeRelease() {
++	ws.mu.Lock()
++	if ws.released || ws.state != wsClosed || !ws.drained {
++		ws.mu.Unlock()
++		return
++	}
++	ws.released = true
++	funcs := ws.funcs
++	ws.funcs = nil
++	ws.mu.Unlock()
++
++	done := js.Global().Get("Promise").Get("resolve").Call("bind", js.Global().Get("Promise"),
++		map[string]any{"value": js.Undefined(), "done": true})
++	ws.messages.Set("next", done)
++	ws.messages.Set("return", done)
++	js.Global().Get("Reflect").Call("set", ws.messages, js.Global().Get("Symbol").Get("asyncIterator"), jsConstant(ws.messages))
++	ws.object.Set("send", jsConstant(wsSendError("the WebSocket is closed", "EPIPE")))
++	ws.object.Set("close", js.Global().Get("Function").Get("prototype"))
++	js.Global().Get("Object").Call("defineProperty", ws.object, "buffered", map[string]any{
++		"value": 0, "enumerable": true, "configurable": true,
++	})
++	go func() {
++		time.Sleep(time.Second)
++		for _, f := range funcs {
++			f.Release()
++		}
++		if ws.onAbort.Truthy() {
++			ws.onAbort.Release()
++		}
++	}()
++}
+diff --git a/cmd/tsconnect/wasm/wasm_js.go b/cmd/tsconnect/wasm/wasm_js.go
+index c42289f..c1a95c9 100644
+--- a/cmd/tsconnect/wasm/wasm_js.go
++++ b/cmd/tsconnect/wasm/wasm_js.go
+@@ -253,6 +253,14 @@ func newIPN(jsConfig js.Value) any {
+ 			}
+ 			return jsIPN.dial(args[0].String(), args[1].String())
+ 		}),
++		"websocket": js.FuncOf(func(this js.Value, args []js.Value) any {
++			if len(args) != 1 || args[0].Type() != js.TypeObject {
++				return promise(func() (any, error) {
++					return nil, &jsError{message: "Usage: websocket({ url, protocols?, headers?, signal? })", status: 400}
++				})
++			}
++			return jsIPN.websocket(args[0])
++		}),
+ 		"setExitNode": js.FuncOf(func(this js.Value, args []js.Value) any {
+ 			expr := ""
+ 			if len(args) > 0 && args[0].Type() == js.TypeString {
+-- 
+2.54.0 (Apple Git-157)
+
