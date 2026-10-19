@@ -1,8 +1,10 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, request } from 'node:http';
+import { createServer as createHttpsServer } from 'node:https';
+import { createSecureContext } from 'node:tls';
 import { connect, createServer as createTcpServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -92,6 +94,44 @@ function webServer(port, body) {
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
 }
 
+function sinkServer(port, stats) {
+  const server = createTcpServer((socket) => {
+    stats.connections++;
+    socket.on('error', () => {});
+    socket.destroy();
+  });
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
+}
+
+async function tlsServer(port, stats, dir, ip) {
+  const key = join(dir, 'tls.key');
+  const cert = join(dir, 'tls.crt');
+  await run('openssl', [
+    'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-days', '1',
+    '-subj', '/CN=peer.slicc.test', '-addext', `subjectAltName=DNS:peer.slicc.test,IP:${ip}`,
+    '-keyout', key, '-out', cert,
+  ]);
+  const context = { key: await readFile(key), cert: await readFile(cert) };
+  const secure = createSecureContext(context);
+  const server = createHttpsServer({
+    ...context,
+    SNICallback: (name, done) => {
+      stats.sni.push(name);
+      done(null, secure);
+    },
+  }, (_req, res) => {
+    stats.requests++;
+    res.end();
+  });
+  server.on('upgrade', (_req, socket) => {
+    stats.requests++;
+    socket.destroy();
+  });
+  server.on('secureConnection', () => stats.secure++);
+  server.on('tlsClientError', (error) => stats.alerts.push(error.message));
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
+}
+
 function wsFrame(op, payload = Buffer.alloc(0), fin = true) {
   const n = payload.length;
   const head = n < 126 ? Buffer.alloc(2) : n < 65536 ? Buffer.alloc(4) : Buffer.alloc(10);
@@ -122,14 +162,22 @@ function wsClosePayload(code, reason) {
 // "pong received" once the pong comes back, "fragments" sends "fragmented"
 // in three frames, and "big" sends a message one byte over 64 MiB. A close
 // frame is answered with the same code and reason.
-function wsServer(port) {
+function wsServer(port, stats, sinkPort) {
   const server = createServer((_req, res) => {
     res.writeHead(426);
     res.end();
   });
+  server.on('connection', () => stats.connections++);
   server.on('upgrade', (req, socket) => {
     socket.on('error', () => {});
     const path = new URL(req.url, 'http://x').pathname;
+    if (path === '/redirect') {
+      const host = new URL(`http://${req.headers.host}`).hostname;
+      socket.end(`HTTP/1.1 302 Found\r\nLocation: http://${host}:${sinkPort}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+      return;
+    }
+    if (path === '/slow')
+      for (const event of ['end', 'close']) socket.on(event, () => (stats.slowClosed ||= Date.now()));
     if (path === '/refuse') {
       socket.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
       return;
@@ -180,6 +228,7 @@ function wsServe(socket, req) {
   const message = (op, payload) => {
     const text = op === 1 ? payload.toString() : null;
     if (text === 'headers') send(1, Buffer.from(JSON.stringify(req.headers)));
+    else if (text === 'raw-headers') send(1, Buffer.from(JSON.stringify(req.rawHeaders)));
     else if (text === 'close-me') {
       closing = true;
       send(8, wsClosePayload(4001, 'server bye'));
@@ -247,8 +296,8 @@ function wsServe(socket, req) {
 // sign-in and no key from anyone. "peer" also serves a WebSocket echo.
 export async function startTailnet() {
   const dir = await mkdtemp(join(tmpdir(), 'slicc-tailnet-'));
-  const [hsPort, proxyPort, stunPort, metricsPort, grpcPort, webPort, echoPort, wsPort] = await Promise.all(
-    Array.from({ length: 8 }, freePort)
+  const [hsPort, proxyPort, stunPort, metricsPort, grpcPort, webPort, echoPort, wsPort, tlsPort, sinkPort] = await Promise.all(
+    Array.from({ length: 10 }, freePort)
   );
   const config = join(dir, 'config.yaml');
   await writeFile(
@@ -332,7 +381,9 @@ unix_socket_permission: "0770"
   servers.push(await corsProxy(hsPort, proxyPort));
   servers.push(await webServer(webPort, `hello from the local tailnet ${Date.now()}`));
   servers.push(await halfCloseServer(echoPort));
-  servers.push(await wsServer(wsPort));
+  const stats = { ws: { connections: 0, slowClosed: 0 }, sink: { connections: 0 }, tls: { alerts: [], sni: [], secure: 0, requests: 0 } };
+  servers.push(await wsServer(wsPort, stats.ws, sinkPort));
+  servers.push(await sinkServer(sinkPort, stats.sink));
 
   const env = { ...process.env, TS_DEBUG_USE_DERP_HTTP: '1' };
   const node = async (name, extra = []) => {
@@ -378,6 +429,7 @@ unix_socket_permission: "0770"
     return { name, ip, socket, cli: `${TAILSCALE} --socket=${socket}` };
   };
   const peer = await node('peer');
+  servers.push(await tlsServer(tlsPort, stats.tls, dir, peer.ip));
   const exit = await node('exit', ['--advertise-exit-node']);
   const nodes = JSON.parse(await hs('nodes', 'list', '-o', 'json'));
   const exitId = String(nodes.find((n) => n.given_name === 'exit' || n.name === 'exit').id);
@@ -386,7 +438,8 @@ unix_socket_permission: "0770"
   return {
     controlURL: `http://127.0.0.1:${proxyPort}`,
     key,
-    peer: { ...peer, web: `http://${peer.ip}:${webPort}/`, echo: `${peer.ip}:${echoPort}`, wsPort },
+    peer: { ...peer, web: `http://${peer.ip}:${webPort}/`, echo: `${peer.ip}:${echoPort}`, wsPort, tlsPort, sinkPort },
+    stats,
     exit,
     async close() {
       for (const server of servers) server.close();
