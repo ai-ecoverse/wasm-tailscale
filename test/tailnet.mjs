@@ -80,7 +80,12 @@ function halfCloseServer(port) {
 }
 
 function webServer(port, body) {
-  const server = createServer((_req, res) => {
+  const server = createServer((req, res) => {
+    if (req.url === '/headers') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(req.headers));
+      return;
+    }
     res.writeHead(200, { 'content-type': 'text/plain' });
     res.end(body);
   });
