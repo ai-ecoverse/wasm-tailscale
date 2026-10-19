@@ -204,6 +204,13 @@ function wsServer(port, stats, sinkPort) {
         setTimeout(() => socket.destroy(), 4000);
         return;
       }
+      if (path === '/unread-over') {
+        socket.write(wsFrame(2, Buffer.alloc(15 * 1024 * 1024, 7)));
+        socket.write(wsFrame(2, Buffer.alloc(2 * 1024 * 1024, 7)));
+        socket.once('data', () => socket.end(wsFrame(8, wsClosePayload(1000, ''))));
+        setTimeout(() => socket.destroy(), 10000);
+        return;
+      }
       if (path === '/unread') {
         socket.write(wsFrame(2, Buffer.alloc(15 * 1024 * 1024, 7)));
         socket.write(wsFrame(8, wsClosePayload(4002, 'unread')));
