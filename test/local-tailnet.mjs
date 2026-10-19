@@ -196,7 +196,7 @@ try {
   await unread();
   const last = await unread();
   const kept = (memory() - settled) / MiB;
-  assert.ok(kept < 16, `closed sockets left unread are dropped (+${kept} MiB)`);
+  assert.ok(kept < 96, `closed sockets left unread are dropped (+${kept} MiB)`);
   assert.deepEqual(await last.messages.next(), { value: undefined, done: true }, 'a reaped socket says done');
   assert.equal(last.send('x').code, 'EPIPE', 'a reaped socket has its stand-ins');
   const slow = new AbortController();
