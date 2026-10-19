@@ -1,0 +1,194 @@
+From 1508f2222d4d6e01586dea751f1817cda15f5c36 Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Mon, 19 Oct 2026 22:13:17 +0200
+Subject: [PATCH] tsconnect: a closed WebSocket drops unread messages only when
+ its owner aborts, over 16 MiB or after 5 idle minutes, and next() then
+ rejects instead of saying done
+
+---
+ cmd/tsconnect/wasm/slicc_websocket_js.go | 95 ++++++++++++++++++++----
+ 1 file changed, 82 insertions(+), 13 deletions(-)
+
+diff --git a/cmd/tsconnect/wasm/slicc_websocket_js.go b/cmd/tsconnect/wasm/slicc_websocket_js.go
+index 18efe95..fe734fe 100644
+--- a/cmd/tsconnect/wasm/slicc_websocket_js.go
++++ b/cmd/tsconnect/wasm/slicc_websocket_js.go
+@@ -41,7 +41,10 @@
+ 	wsMaxReason = 123
+ )
+ 
+-var wsUnreadGrace = 5 * time.Second
++var (
++	wsUnreadIdle = 5 * time.Minute
++	wsHeldCap    = wsQueued
++)
+ 
+ const (
+ 	wsOpen = iota
+@@ -85,6 +88,9 @@ type jsWebSocket struct {
+ 	closeErr   error
+ 	nextTail   chan struct{} // the previous next() call, which this one waits for
+ 	nexts      int
++	dropped    int
++	dropErr    js.Value
++	ownerGone  bool
+ 	released   bool
+ 	resolveEnd js.Value
+ 	signal     js.Value
+@@ -452,8 +458,19 @@ func (ws *jsWebSocket) close(code int, reason string) {
+ // settles with 1006 when it wasn't.
+ func (ws *jsWebSocket) abort() {
+ 	ws.mu.Lock()
++	if ws.conn == nil {
++		ws.mu.Unlock()
++		return
++	}
++	if ws.state == wsClosed {
++		ws.dropLocked(ws.abortDrop)
++		ws.mu.Unlock()
++		ws.maybeRelease()
++		return
++	}
++	ws.ownerGone = true
+ 	defer ws.mu.Unlock()
+-	if ws.conn == nil || ws.state != wsOpen {
++	if ws.state != wsOpen {
+ 		return
+ 	}
+ 	ws.state = wsClosing
+@@ -470,7 +487,7 @@ func (ws *jsWebSocket) abort() {
+ 
+ // next is messages.next(). Calls are answered in the order they were made.
+ func (ws *jsWebSocket) next() js.Value {
+-	p, resolve, _ := jsPromise()
++	p, resolve, reject := jsPromise()
+ 	ws.mu.Lock()
+ 	ws.nexts++
+ 	ws.mu.Unlock()
+@@ -485,8 +502,13 @@ func (ws *jsWebSocket) next() js.Value {
+ 			ws.cond.Wait()
+ 		}
+ 		if len(ws.inbox) == 0 {
++			dropErr := ws.dropErr
+ 			ws.mu.Unlock()
+-			resolve.Invoke(map[string]any{"value": js.Undefined(), "done": true})
++			if dropErr.Truthy() {
++				reject.Invoke(dropErr)
++			} else {
++				resolve.Invoke(map[string]any{"value": js.Undefined(), "done": true})
++			}
+ 			ws.markDrained()
+ 			return
+ 		}
+@@ -520,7 +542,12 @@ func (ws *jsWebSocket) readLoop() {
+ 			return
+ 		}
+ 		ws.mu.Lock()
+-		if !ws.discard {
++		switch {
++		case ws.discard:
++		case ws.dropped > 0 || ws.state != wsOpen && ws.inboxBytes+len(b) > wsHeldCap:
++			ws.dropped += len(ws.inbox) + 1
++			ws.inbox, ws.inboxBytes = nil, 0
++		default:
+ 			ws.inbox = append(ws.inbox, wsIn{text: typ == websocket.MessageText, data: b})
+ 			ws.inboxBytes += len(b)
+ 			ws.cond.Broadcast()
+@@ -598,13 +625,49 @@ func (ws *jsWebSocket) finish(err error) {
+ 	ws.sendq = nil
+ 	ws.inflight = 0
+ 	ws.buffered.Store(0)
++	reap := false
++	switch {
++	case ws.ownerGone:
++		ws.dropLocked(ws.abortDrop)
++	case ws.dropped > 0 || ws.inboxBytes > wsHeldCap:
++		ws.dropLocked(func(n int) js.Value {
++			return wsDropError(n, fmt.Sprintf("the WebSocket closed holding over %d MiB of unread messages", wsHeldCap>>20))
++		})
++	default:
++		reap = true
++	}
+ 	ws.cond.Broadcast()
+ 	ws.mu.Unlock()
+ 	go ws.conn.CloseNow()
+-	ws.unlisten()
+ 	ws.resolveEnd.Invoke(map[string]any{"code": code, "reason": reason})
+ 	ws.maybeRelease()
+-	go ws.reapUnread()
++	if reap {
++		go ws.reapUnread()
++	}
++}
++
++func wsDropError(n int, why string) js.Value {
++	e := js.Global().Get("Error").New(fmt.Sprintf("%d unread WebSocket messages dropped: %s", n, why))
++	e.Set("code", "EDROPPED")
++	e.Set("dropped", n)
++	return e
++}
++
++func (ws *jsWebSocket) abortDrop(int) js.Value {
++	return abortReason(ws.signal)
++}
++
++func (ws *jsWebSocket) dropLocked(why func(n int) js.Value) {
++	if ws.drained {
++		return
++	}
++	if n := len(ws.inbox) + ws.dropped; n > 0 {
++		ws.dropErr = why(n)
++	}
++	ws.discard = true
++	ws.drained = true
++	ws.inbox, ws.inboxBytes, ws.dropped = nil, 0, 0
++	ws.cond.Broadcast()
+ }
+ 
+ func (ws *jsWebSocket) reapUnread() {
+@@ -612,18 +675,18 @@ func (ws *jsWebSocket) reapUnread() {
+ 		ws.mu.Lock()
+ 		seen := ws.nexts
+ 		ws.mu.Unlock()
+-		time.Sleep(wsUnreadGrace)
++		time.Sleep(wsUnreadIdle)
+ 		ws.mu.Lock()
+ 		if ws.drained {
+ 			ws.mu.Unlock()
+ 			return
+ 		}
+ 		if ws.nexts == seen {
+-			ws.discard = true
+-			ws.inbox, ws.inboxBytes = nil, 0
+-			ws.cond.Broadcast()
++			ws.dropLocked(func(n int) js.Value {
++				return wsDropError(n, fmt.Sprintf("the WebSocket closed and they weren't read within %g minutes", wsUnreadIdle.Minutes()))
++			})
+ 			ws.mu.Unlock()
+-			ws.markDrained()
++			ws.maybeRelease()
+ 			return
+ 		}
+ 		ws.mu.Unlock()
+@@ -654,11 +717,17 @@ func (ws *jsWebSocket) maybeRelease() {
+ 	ws.released = true
+ 	funcs := ws.funcs
+ 	ws.funcs = nil
++	dropErr := ws.dropErr
+ 	ws.mu.Unlock()
++	ws.unlisten()
+ 
+ 	done := js.Global().Get("Promise").Get("resolve").Call("bind", js.Global().Get("Promise"),
+ 		map[string]any{"value": js.Undefined(), "done": true})
+-	ws.messages.Set("next", done)
++	if dropErr.Truthy() {
++		ws.messages.Set("next", js.Global().Get("Promise").Get("reject").Call("bind", js.Global().Get("Promise"), dropErr))
++	} else {
++		ws.messages.Set("next", done)
++	}
+ 	ws.messages.Set("return", done)
+ 	js.Global().Get("Reflect").Call("set", ws.messages, js.Global().Get("Symbol").Get("asyncIterator"), jsConstant(ws.messages))
+ 	ws.object.Set("send", jsConstant(wsSendError("the WebSocket is closed", "EPIPE")))
+-- 
+2.54.0 (Apple Git-157)
+
