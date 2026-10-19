@@ -154,7 +154,16 @@ function wsServer(port) {
       if (path === '/deaf') {
         socket.pause();
         setTimeout(() => socket.destroy(), 4000);
-      } else wsServe(socket, req);
+        return;
+      }
+      if (path === '/unread') {
+        socket.write(wsFrame(2, Buffer.alloc(15 * 1024 * 1024, 7)));
+        socket.write(wsFrame(8, wsClosePayload(4002, 'unread')));
+        socket.on('data', () => socket.end());
+        setTimeout(() => socket.destroy(), 10000);
+        return;
+      }
+      wsServe(socket, req);
     };
     setTimeout(answer, path === '/slow' ? 5000 : 0);
   });
