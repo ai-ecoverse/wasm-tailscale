@@ -1,0 +1,101 @@
+From 5cc5bf43065d4c635233a48515a75335394f648f Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Mon, 19 Oct 2026 20:50:40 +0200
+Subject: [PATCH] tsconnect: websocket refuses a text send over 64 MiB before
+ copying it into Go, and drops a closed socket's unread messages after 5 s
+
+---
+ cmd/tsconnect/wasm/slicc_websocket_js.go | 42 +++++++++++++++++++++---
+ 1 file changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/cmd/tsconnect/wasm/slicc_websocket_js.go b/cmd/tsconnect/wasm/slicc_websocket_js.go
+index fc7b6cd..18efe95 100644
+--- a/cmd/tsconnect/wasm/slicc_websocket_js.go
++++ b/cmd/tsconnect/wasm/slicc_websocket_js.go
+@@ -41,6 +41,8 @@
+ 	wsMaxReason = 123
+ )
+ 
++var wsUnreadGrace = 5 * time.Second
++
+ const (
+ 	wsOpen = iota
+ 	wsClosing
+@@ -82,6 +84,7 @@ type jsWebSocket struct {
+ 	closeDone  chan struct{} // closed once that handshake has returned
+ 	closeErr   error
+ 	nextTail   chan struct{} // the previous next() call, which this one waits for
++	nexts      int
+ 	released   bool
+ 	resolveEnd js.Value
+ 	signal     js.Value
+@@ -392,7 +395,14 @@ func (ws *jsWebSocket) send(v js.Value) js.Value {
+ 	var out wsOut
+ 	switch u8 := js.Global().Get("Uint8Array"); {
+ 	case v.Type() == js.TypeString:
+-		out = wsOut{typ: websocket.MessageText, data: []byte(v.String())}
++		if js.Global().Get("String").New(v).Get("length").Int() > wsMaxMessage {
++			return tooBig()
++		}
++		encoded := js.Global().Get("TextEncoder").New().Call("encode", v)
++		if encoded.Get("byteLength").Int() > wsMaxMessage {
++			return tooBig()
++		}
++		out = wsOut{typ: websocket.MessageText, data: bytesFromJS(encoded)}
+ 	case v.Type() == js.TypeObject && js.Global().Get("ArrayBuffer").Call("isView", v).Bool():
+ 		if v.Get("byteLength").Int() > wsMaxMessage {
+ 			return tooBig()
+@@ -409,9 +419,6 @@ func (ws *jsWebSocket) send(v js.Value) js.Value {
+ 	default:
+ 		return js.Global().Get("TypeError").New("send: a string, Uint8Array or ArrayBuffer")
+ 	}
+-	if len(out.data) > wsMaxMessage {
+-		return tooBig()
+-	}
+ 	ws.mu.Lock()
+ 	defer ws.mu.Unlock()
+ 	if ws.state != wsOpen {
+@@ -464,6 +471,9 @@ func (ws *jsWebSocket) abort() {
+ // next is messages.next(). Calls are answered in the order they were made.
+ func (ws *jsWebSocket) next() js.Value {
+ 	p, resolve, _ := jsPromise()
++	ws.mu.Lock()
++	ws.nexts++
++	ws.mu.Unlock()
+ 	prev := ws.nextTail
+ 	mine := make(chan struct{})
+ 	ws.nextTail = mine
+@@ -594,6 +604,30 @@ func (ws *jsWebSocket) finish(err error) {
+ 	ws.unlisten()
+ 	ws.resolveEnd.Invoke(map[string]any{"code": code, "reason": reason})
+ 	ws.maybeRelease()
++	go ws.reapUnread()
++}
++
++func (ws *jsWebSocket) reapUnread() {
++	for {
++		ws.mu.Lock()
++		seen := ws.nexts
++		ws.mu.Unlock()
++		time.Sleep(wsUnreadGrace)
++		ws.mu.Lock()
++		if ws.drained {
++			ws.mu.Unlock()
++			return
++		}
++		if ws.nexts == seen {
++			ws.discard = true
++			ws.inbox, ws.inboxBytes = nil, 0
++			ws.cond.Broadcast()
++			ws.mu.Unlock()
++			ws.markDrained()
++			return
++		}
++		ws.mu.Unlock()
++	}
+ }
+ 
+ func (ws *jsWebSocket) unlisten() {
+-- 
+2.54.0 (Apple Git-157)
+

@@ -36,7 +36,10 @@ try {
   };
   const go = new globalThis.Go();
   go.env = { TS_DEBUG_USE_DERP_HTTP: '1' };
-  void go.run((await WebAssembly.instantiate(readFileSync(new URL('main.wasm', dir)), go.importObject)).instance);
+  const { instance } = await WebAssembly.instantiate(readFileSync(new URL('main.wasm', dir)), go.importObject);
+  void go.run(instance);
+  const memory = () => instance.exports.mem.buffer.byteLength;
+  const MiB = 1024 * 1024;
   while (typeof globalThis.newIPN !== 'function') await new Promise((resolve) => setTimeout(resolve, 10));
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const state = new Map();
@@ -174,6 +177,28 @@ try {
     }, 'a refused handshake rejects with its status');
   }
   const base = `ws://${tailnet.peer.ip}:${wsPort}`;
+  const late = await ipn.websocket({ url: `${base}/unread` });
+  assert.equal((await late.closed).code, 4002);
+  await wait(1000);
+  assert.equal((await next(late)).length, 15 * MiB, 'a closed socket still gives what it received, read soon after');
+  const unread = async () => {
+    let ws;
+    for (let n = 0; n < 8; n++) {
+      ws = await ipn.websocket({ url: `${base}/unread` });
+      await ws.closed;
+    }
+    await wait(6000);
+    return ws;
+  };
+  await unread();
+  const settled = memory();
+  await unread();
+  await unread();
+  const last = await unread();
+  const kept = (memory() - settled) / MiB;
+  assert.ok(kept < 96, `closed sockets left unread are dropped (+${kept} MiB)`);
+  assert.deepEqual(await last.messages.next(), { value: undefined, done: true }, 'a reaped socket says done');
+  assert.equal(last.send('x').code, 'EPIPE', 'a reaped socket has its stand-ins');
   const slow = new AbortController();
   const pending = ipn.websocket({ url: `${base}/slow`, signal: slow.signal });
   setTimeout(() => slow.abort(), 500);
@@ -210,6 +235,14 @@ try {
   flood.send('big');
   assert.equal((await flood.closed).code, 1009, 'receiving over 64 MiB closes with 1009');
   assert.deepEqual(await flood.messages.next(), { value: undefined, done: true });
+  for (const [text, what] of [['x'.repeat(64 * MiB + 1), 'ASCII'], ['€'.repeat(22369622), 'UTF-8']]) {
+    const ws = await ipn.websocket({ url: `${base}/echo` });
+    const before = memory();
+    assert.equal(ws.send(text).code, 'EMSGSIZE', `text over 64 MiB (${what})`);
+    assert.equal((await ws.closed).code, 1009, `text over 64 MiB closes with 1009 (${what})`);
+    const grown = (memory() - before) / MiB;
+    assert.ok(grown < 16, `text over 64 MiB is refused before it reaches Go (${what}, +${grown} MiB)`);
+  }
   await assert.rejects(ipn.websocket({ url: `ws://${tailnet.peer.ip}:1/` }), 'a closed port rejects');
   assert.deepEqual(
     browserSockets.filter((url) => url.includes(`:${wsPort}`)),

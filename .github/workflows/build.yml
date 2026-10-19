@@ -34,7 +34,7 @@ jobs:
           node test/login-bursts.mjs healthy
           node test/login-bursts.mjs failed-start
       - name: A local tailnet (headscale and two userspace tailscaled)
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/tailnet" && cd "$RUNNER_TEMP/tailnet"
