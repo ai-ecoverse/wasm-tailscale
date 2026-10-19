@@ -177,28 +177,40 @@ try {
     }, 'a refused handshake rejects with its status');
   }
   const base = `ws://${tailnet.peer.ip}:${wsPort}`;
-  const late = await ipn.websocket({ url: `${base}/unread` });
-  assert.equal((await late.closed).code, 4002);
-  await wait(1000);
-  assert.equal((await next(late)).length, 15 * MiB, 'a closed socket still gives what it received, read soon after');
-  const unread = async () => {
+  const slowReader = await ipn.websocket({ url: `${base}/unread` });
+  assert.equal((await slowReader.closed).code, 4002);
+  await wait(10000);
+  assert.equal((await next(slowReader)).length, 15 * MiB, 'a reader busy for 10 s after the close still gets every message');
+  assert.deepEqual(await slowReader.messages.next(), { value: undefined, done: true });
+  const exits = async () => {
     let ws;
     for (let n = 0; n < 8; n++) {
-      ws = await ipn.websocket({ url: `${base}/unread` });
+      const owner = new AbortController();
+      ws = await ipn.websocket({ url: `${base}/unread`, signal: owner.signal });
       await ws.closed;
+      owner.abort();
+      await assert.rejects(ws.messages.next(), { name: 'AbortError' }, 'unread messages of an exited owner reject next()');
     }
-    await wait(6000);
     return ws;
   };
-  await unread();
+  await exits();
   const settled = memory();
-  await unread();
-  await unread();
-  const last = await unread();
+  await exits();
+  await exits();
+  const last = await exits();
   const kept = (memory() - settled) / MiB;
-  assert.ok(kept < 96, `closed sockets left unread are dropped (+${kept} MiB)`);
-  assert.deepEqual(await last.messages.next(), { value: undefined, done: true }, 'a reaped socket says done');
-  assert.equal(last.send('x').code, 'EPIPE', 'a reaped socket has its stand-ins');
+  assert.ok(kept < 96, `an exited owner's unread messages are released at once (+${kept} MiB)`);
+  assert.equal(last.send('x').code, 'EPIPE', 'a released socket has its stand-ins');
+  const over = await ipn.websocket({ url: `${base}/unread-over` });
+  await wait(10000);
+  over.close();
+  await over.closed;
+  await assert.rejects(over.messages.next(), (error) => {
+    assert.equal(error.code, 'EDROPPED');
+    assert.equal(error.dropped, 2);
+    assert.match(error.message, /2 unread WebSocket messages dropped: the WebSocket closed holding over 16 MiB/);
+    return true;
+  }, 'messages over the cap held by a closed socket reject next(), never a silent done');
   const stats = tailnet.stats;
   const tlsPort = tailnet.peer.tlsPort;
   for (const url of [`wss://${tailnet.peer.ip}:${tlsPort}/`, `wss://${peerDNS}:${tlsPort}/`, `https://${peerDNS}:${tlsPort}/`])
