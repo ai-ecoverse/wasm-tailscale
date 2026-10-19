@@ -1,0 +1,115 @@
+From f2bec654d472d2e9d1e403600d7bf6e485ceef2d Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Mon, 19 Oct 2026 20:19:08 +0200
+Subject: [PATCH] tsconnect: fetch and websocket drop every hop-by-hop header,
+ Proxy-Authorization and the headers Connection names included
+
+---
+ cmd/tsconnect/wasm/slicc_js.go           | 41 +++++++++++++++++++++---
+ cmd/tsconnect/wasm/slicc_websocket_js.go | 17 ++++------
+ 2 files changed, 43 insertions(+), 15 deletions(-)
+
+diff --git a/cmd/tsconnect/wasm/slicc_js.go b/cmd/tsconnect/wasm/slicc_js.go
+index d8db7fe..bc24cce 100644
+--- a/cmd/tsconnect/wasm/slicc_js.go
++++ b/cmd/tsconnect/wasm/slicc_js.go
+@@ -79,6 +79,38 @@ func bytesToJS(b []byte) js.Value {
+ 	return arr
+ }
+ 
++var hopByHopHeaders = map[string]bool{
++	"connection":          true,
++	"keep-alive":          true,
++	"proxy-authenticate":  true,
++	"proxy-authorization": true,
++	"proxy-connection":    true,
++	"te":                  true,
++	"trailer":             true,
++	"transfer-encoding":   true,
++	"upgrade":             true,
++}
++
++func connectionNamed(hs js.Value) map[string]bool {
++	named := map[string]bool{}
++	for n := 0; n < hs.Length(); n++ {
++		pair := hs.Index(n)
++		if !strings.EqualFold(pair.Index(0).String(), "connection") {
++			continue
++		}
++		for _, token := range strings.Split(pair.Index(1).String(), ",") {
++			if token = strings.ToLower(strings.TrimSpace(token)); token != "" {
++				named[token] = true
++			}
++		}
++	}
++	return named
++}
++
++func hopByHop(lower string, named map[string]bool) bool {
++	return hopByHopHeaders[lower] || named[lower]
++}
++
+ func headersToJS(h http.Header) []any {
+ 	out := []any{}
+ 	for name, values := range h {
+@@ -238,15 +270,16 @@ func (i *jsIPN) fetch2(req js.Value) js.Value {
+ 			return nil, &jsError{message: err.Error(), status: 400}
+ 		}
+ 		if hs := req.Get("headers"); !hs.IsUndefined() {
++			named := connectionNamed(hs)
+ 			for n := 0; n < hs.Length(); n++ {
+ 				pair := hs.Index(n)
+ 				name := pair.Index(0).String()
+ 				value := pair.Index(1).String()
+-				switch strings.ToLower(name) {
+-				case "host":
++				switch lower := strings.ToLower(name); {
++				case lower == "content-length", hopByHop(lower, named):
++				case lower == "host":
+ 					hr.Host = value
+-				case "content-length", "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
+-				case "accept-encoding":
++				case lower == "accept-encoding":
+ 					if encoded {
+ 						hr.Header.Add(name, value)
+ 					}
+diff --git a/cmd/tsconnect/wasm/slicc_websocket_js.go b/cmd/tsconnect/wasm/slicc_websocket_js.go
+index 20aa9a4..fc7b6cd 100644
+--- a/cmd/tsconnect/wasm/slicc_websocket_js.go
++++ b/cmd/tsconnect/wasm/slicc_websocket_js.go
+@@ -157,16 +157,10 @@ func wsReason(reason string) string {
+ // wsSkipHeader reports whether a handshake header given by the caller is
+ // dropped: the ones the WebSocket handshake itself sets (Host, Connection,
+ // Upgrade, Sec-WebSocket-*), Cookie, and the other hop-by-hop headers.
+-func wsSkipHeader(name string) bool {
+-	switch name = strings.ToLower(name); {
+-	case strings.HasPrefix(name, "sec-websocket-"):
+-		return true
+-	case name == "host", name == "connection", name == "upgrade", name == "cookie",
+-		name == "content-length", name == "transfer-encoding", name == "keep-alive",
+-		name == "proxy-connection", name == "te", name == "trailer":
+-		return true
+-	}
+-	return false
++func wsSkipHeader(name string, named map[string]bool) bool {
++	name = strings.ToLower(name)
++	return strings.HasPrefix(name, "sec-websocket-") || hopByHop(name, named) ||
++		name == "host" || name == "cookie" || name == "content-length"
+ }
+ 
+ func (i *jsIPN) wsClient() *http.Client {
+@@ -265,9 +259,10 @@ func (i *jsIPN) websocket(req js.Value) js.Value {
+ 		}
+ 	}
+ 	if hs := req.Get("headers"); hs.Type() == js.TypeObject {
++		named := connectionNamed(hs)
+ 		for n := 0; n < hs.Length(); n++ {
+ 			pair := hs.Index(n)
+-			if name := pair.Index(0).String(); !wsSkipHeader(name) {
++			if name := pair.Index(0).String(); !wsSkipHeader(name, named) {
+ 				opts.HTTPHeader.Add(name, pair.Index(1).String())
+ 			}
+ 		}
+-- 
+2.54.0 (Apple Git-157)
+
