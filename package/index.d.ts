@@ -57,7 +57,7 @@ export interface IPNWebSocketRequest {
   /** ws:, wss:, http: or https:. wss: is verified against the bundled roots. */
   url: string;
   protocols?: string[] | string;
-  /** Sent with the handshake, except Host, Connection, Upgrade, Sec-WebSocket-*, Cookie and the other hop-by-hop headers. */
+  /** Sent with the handshake, except Host, Sec-WebSocket-*, Cookie, Content-Length, Connection and the headers it names, Keep-Alive, Proxy-Authorization, Proxy-Authenticate, Proxy-Connection, TE, Trailer, Transfer-Encoding and Upgrade. */
   headers?: [string, string][];
   /** Cancels the handshake (rejecting with signal.reason) and closes an open socket with 1001, dropping what send() queued; a write in progress is cancelled, which tears the connection down (1006). */
   signal?: AbortSignal;

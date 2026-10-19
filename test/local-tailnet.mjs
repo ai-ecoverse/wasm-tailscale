@@ -74,6 +74,24 @@ try {
   assert.match(await readAll(http), /^HTTP\/1\.[01] 200[\s\S]*hello from the local tailnet/);
   http.close();
 
+  const hopByHop = [
+    ['Proxy-Authorization', 'Basic cHJveHk6c2VjcmV0'],
+    ['proxy-authenticate', 'Basic realm="x"'],
+    ['TE', 'trailers'],
+    ['Trailer', 'X-Late'],
+    ['Keep-Alive', 'timeout=5'],
+    ['Connection', 'close, X-Named-Hop'],
+    ['X-Named-Hop', 'dropped'],
+    ['x-kept', 'kept'],
+  ];
+  const assertNoHopByHop = (seen, where) => {
+    for (const name of ['proxy-authorization', 'proxy-authenticate', 'te', 'trailer', 'keep-alive', 'x-named-hop'])
+      assert.equal(seen[name], undefined, `${where} drops ${name}`);
+    assert.equal(seen['x-kept'], 'kept', `${where} keeps an end-to-end header`);
+  };
+  const echoed = await ipn.fetch({ url: `${tailnet.peer.web}headers`, method: 'GET', headers: hopByHop });
+  assertNoHopByHop(JSON.parse(await readAll(echoed)), 'fetch');
+
   const echo = await ipn.dial('tcp', tailnet.peer.echo);
   await echo.write(new TextEncoder().encode('hello'));
   echo.closeWrite();
@@ -101,6 +119,7 @@ try {
         ['sec-websocket-key', 'bogus'],
         ['connection', 'close'],
         ['upgrade', 'h2c'],
+        ...hopByHop,
       ],
     });
     assert.equal(ws.protocol, 'chat.v2', `the chosen subprotocol (${host})`);
@@ -120,6 +139,7 @@ try {
     assert.equal(seen.host, `${host}:${wsPort}`, 'Host is the URL’s');
     assert.notEqual(seen['sec-websocket-key'], 'bogus', 'Sec-WebSocket-* are the handshake’s own');
     assert.equal(seen.upgrade, 'websocket');
+    assertNoHopByHop(seen, `websocket (${host})`);
     ws.send('ping-me');
     assert.equal(await next(ws), 'pong received', 'a ping is answered in Go and never surfaced');
     ws.send('fragments');
