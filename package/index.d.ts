@@ -73,7 +73,8 @@ export interface IPNWebSocketClose {
  * RealmWebSocket, except that send() returns an Error instead of throwing.
  * Once `closed` has settled and `messages` has ended, its functions become
  * plain JS stand-ins and Go's are released a second later: don't keep
- * references to them past that.
+ * references to them past that. A closed socket whose `messages` gets no
+ * next() for 5 s drops what it holds and is released the same way.
  */
 export interface IPNWebSocket {
   /** The subprotocol the server chose, or "". */
