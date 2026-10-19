@@ -199,10 +199,99 @@ try {
   assert.ok(kept < 96, `closed sockets left unread are dropped (+${kept} MiB)`);
   assert.deepEqual(await last.messages.next(), { value: undefined, done: true }, 'a reaped socket says done');
   assert.equal(last.send('x').code, 'EPIPE', 'a reaped socket has its stand-ins');
+  const stats = tailnet.stats;
+  const tlsPort = tailnet.peer.tlsPort;
+  for (const url of [`wss://${tailnet.peer.ip}:${tlsPort}/`, `wss://${peerDNS}:${tlsPort}/`, `https://${peerDNS}:${tlsPort}/`])
+    await assert.rejects(ipn.websocket({ url }), /x509/, `an untrusted certificate is refused (${url})`);
+  await wait(200);
+  assert.equal(stats.tls.secure, 0, 'no TLS session is established');
+  assert.equal(stats.tls.requests, 0, 'no HTTP request is sent over an untrusted TLS connection');
+  assert.equal(stats.tls.alerts.length, 3, 'each refusal reaches the server as a TLS alert');
+  for (const alert of stats.tls.alerts) assert.match(alert, /bad.certificate/i);
+  assert.deepEqual(stats.tls.sni, [peerDNS, peerDNS], 'the SNI is the MagicDNS name');
+
+  const cased = await ipn.websocket({
+    url: `${base}/echo`,
+    headers: [
+      ['COOKIE', 'a=1'],
+      ['CoOkIe', 'b=2'],
+      ['HOST', 'elsewhere.example'],
+      ['SEC-WEBSOCKET-PROTOCOL', 'chat.v2'],
+      ['Sec-WebSocket-Extensions', 'permessage-deflate'],
+      ['Keep-Alive', 'timeout=5'],
+      ['TE', 'trailers'],
+      ['Trailer', 'X-Late'],
+      ['Transfer-Encoding', 'chunked'],
+      ['Content-Length', '5'],
+      ['X-Mixed-Case', 'kept'],
+    ],
+  });
+  cased.send('raw-headers');
+  const raw = JSON.parse(await next(cased));
+  const rawNames = raw.filter((_, n) => n % 2 === 0).map((name) => name.toLowerCase());
+  const rawValue = (name) => raw[rawNames.indexOf(name) * 2 + 1];
+  for (const name of ['cookie', 'sec-websocket-protocol', 'sec-websocket-extensions', 'keep-alive', 'te', 'trailer', 'transfer-encoding', 'content-length'])
+    assert.ok(!rawNames.includes(name), `${name} in any case is dropped`);
+  assert.equal(rawNames.filter((name) => name === 'host').length, 1, 'one Host');
+  assert.equal(rawValue('host'), `${tailnet.peer.ip}:${wsPort}`, 'Host is the URL’s');
+  assert.equal(rawValue('sec-websocket-version'), '13');
+  assert.equal(rawValue('x-mixed-case'), 'kept');
+  cased.close();
+  await cased.closed;
+
+  const connections = () => stats.ws.connections + stats.sink.connections;
+  const quiet = async (what, attempt) => {
+    const before = connections();
+    await assert.rejects(attempt(), what);
+    await wait(100);
+    assert.equal(connections(), before, `${what}: nothing reaches a server`);
+  };
+  for (const [name, value] of [
+    ['x-bad\r\nx-injected', 'v'],
+    ['x-ok', 'a\r\nx-injected: 1'],
+    ['x-ok', 'a\nb'],
+    ['x-ok', 'a\0b'],
+    ['x-bad\0', 'v'],
+  ])
+    await quiet(`CR, LF or NUL in ${JSON.stringify([name, value])}`, () => ipn.websocket({ url: `${base}/echo`, headers: [[name, value]] }));
+  for (const url of [
+    `ftp://${tailnet.peer.ip}:${wsPort}/`,
+    'file:///etc/passwd',
+    'javascript:alert(1)',
+    'data:text/plain,x',
+    `blob:http://${tailnet.peer.ip}:${wsPort}/x`,
+    `gopher://${tailnet.peer.ip}:${wsPort}/`,
+    '/echo',
+    'ws:///echo',
+  ])
+    await quiet(`the URL ${url}`, () => ipn.websocket({ url }));
+  const sinkBefore = stats.sink.connections;
+  await assert.rejects(
+    ipn.websocket({ url: `${base}/redirect`, headers: [['authorization', 'Bearer secret']] }),
+    (error) => error.status === 302,
+    'a redirect rejects with its status'
+  );
+  await wait(200);
+  assert.equal(stats.sink.connections, sinkBefore, 'a redirect is not followed');
+  const loopback = async (when) => {
+    for (const host of ['127.0.0.1', 'localhost'])
+      await quiet(`ws://${host} ${when}`, () => ipn.websocket({ url: `ws://${host}:${tailnet.peer.sinkPort}/` }));
+  };
+  await loopback('without an exit node');
+
   const slow = new AbortController();
   const pending = ipn.websocket({ url: `${base}/slow`, signal: slow.signal });
-  setTimeout(() => slow.abort(), 500);
+  let abortedAt = 0;
+  setTimeout(() => {
+    abortedAt = Date.now();
+    slow.abort();
+  }, 500);
   await assert.rejects(pending, { name: 'AbortError' }, 'abort cancels the handshake');
+  for (let waited = 0; waited < 2000 && !tailnet.stats.ws.slowClosed; waited += 50) await wait(50);
+  assert.ok(
+    tailnet.stats.ws.slowClosed && tailnet.stats.ws.slowClosed - abortedAt < 1000,
+    'abort tears the handshake’s connection down within 1 s'
+  );
   await assert.rejects(ipn.websocket({ url: `${base}/echo`, signal: AbortSignal.abort() }), { name: 'AbortError' });
   const live = new AbortController();
   const aborted = await ipn.websocket({ url: `${base}/echo`, signal: live.signal });
@@ -281,6 +370,7 @@ try {
   const traced = await trace().catch((error) => `failed: ${error.message}`);
   console.error('TRACE', traced.slice(0, 200));
   assert.match(traced, /^ip=/m, 'the internet through the exit node');
+  await loopback('with an exit node');
   console.error('ok: joined a local headscale tailnet, dialled a peer, half-closed, WebSockets by address and name, nothing inbound, exit node by name and ID');
   await done(0);
 } catch (error) {
