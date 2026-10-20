@@ -211,6 +211,15 @@ try {
     assert.match(error.message, /2 unread WebSocket messages dropped: the WebSocket closed holding over 16 MiB/);
     return true;
   }, 'messages over the cap held by a closed socket reject next(), never a silent done');
+  for (let round = 1; round <= 3; round++) {
+    const talker = await ipn.websocket({ url: `${base}/close-talk` });
+    talker.close(4000, 'bye');
+    const said = await talker.messages.next();
+    assert.equal(said.done, false, `a message the peer sends after our close arrives before done (round ${round})`);
+    assert.equal(said.value, 'z'.repeat(MiB), `the peer's last message, whole (round ${round})`);
+    assert.deepEqual(await talker.messages.next(), { value: undefined, done: true });
+    assert.deepEqual(await talker.closed, { code: 4003, reason: 'talked' }, `closed settles with the peer's close frame (round ${round})`);
+  }
   const stats = tailnet.stats;
   const tlsPort = tailnet.peer.tlsPort;
   for (const url of [`wss://${tailnet.peer.ip}:${tlsPort}/`, `wss://${peerDNS}:${tlsPort}/`, `https://${peerDNS}:${tlsPort}/`])
