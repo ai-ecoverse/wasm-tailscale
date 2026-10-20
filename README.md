@@ -62,7 +62,7 @@ node test/storage-failure.mjs start  # broken storage during run(): reported, lo
 node test/logout-check.mjs # interactive: join, logout, login again; prints sign-in links to /tmp/logout-check.out
 ```
 
-The build uses Tailscale's pinned Go toolchain (`./tool/go`), `-trimpath`, `-buildvcs=false` and an empty build ID, so the same tag and patches give the same `main.wasm` on any machine. The packed tarball holds the same files everywhere. Its gzip bytes depend on Node's zlib, so CI pins Node `24.21.0`, and `publish` publishes the certified CI artifact itself rather than a repack.
+The build uses Tailscale's pinned Go toolchain (`./tool/go`), `-trimpath`, `-buildvcs=false` and an empty build ID, so the same tag and patches give the same `main.wasm` on any machine. The packed tarball holds the same files everywhere. Its gzip bytes depend on Node's zlib, so CI pins Node `24.22.0`, and `publish` publishes the certified CI artifact itself rather than a repack.
 
 ## Updating
 
