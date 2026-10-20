@@ -1,0 +1,121 @@
+From b213a3d6f43c853c52003b72785964f49f6d1168 Mon Sep 17 00:00:00 2001
+From: Lars Trieloff <lars@trieloff.net>
+Date: Tue, 20 Oct 2026 21:59:51 +0200
+Subject: [PATCH] tsconnect: after our own close(), websocket keeps delivering
+ the peer's messages until its close frame, as a browser does in CLOSING
+
+coder/websocket's Conn.Close reads and discards every frame until the
+peer's close frame, racing readLoop for readMu, so a message the peer
+sent before its close could vanish. The vendored package gains
+Conn.SendClose, which only writes the close frame; readLoop then reads
+on, within the held-message cap, until the peer's close frame, which
+settles closed. The peer has 5 s, as in Close, before the connection
+is torn down.
+---
+ cmd/tsconnect/wasm/slicc_websocket_js.go | 35 ++++++++++--------------
+ tempfork/coder/websocket/README.md       |  2 ++
+ tempfork/coder/websocket/close.go        |  4 +++
+ 3 files changed, 20 insertions(+), 21 deletions(-)
+
+diff --git a/cmd/tsconnect/wasm/slicc_websocket_js.go b/cmd/tsconnect/wasm/slicc_websocket_js.go
+index f9cc8ec..3a4b7da 100644
+--- a/cmd/tsconnect/wasm/slicc_websocket_js.go
++++ b/cmd/tsconnect/wasm/slicc_websocket_js.go
+@@ -83,9 +83,7 @@ type jsWebSocket struct {
+ 	stopWrite  context.CancelFunc // cancels the write in progress
+ 	closeCode  websocket.StatusCode
+ 	closeWhy   string
+-	closing    bool          // the writer has started the close handshake
+-	closeDone  chan struct{} // closed once that handshake has returned
+-	closeErr   error
++	closeTimer *time.Timer
+ 	nextTail   chan struct{} // the previous next() call, which this one waits for
+ 	nexts      int
+ 	dropped    int
+@@ -279,7 +277,7 @@ func (i *jsIPN) websocket(req js.Value) js.Value {
+ 	}
+ 
+ 	ctx, cancel := context.WithCancel(context.Background())
+-	ws := &jsWebSocket{signal: signal, closeDone: make(chan struct{}), wake: make(chan struct{}, 1)}
++	ws := &jsWebSocket{signal: signal, wake: make(chan struct{}, 1)}
+ 	ws.cond = sync.NewCond(&ws.mu)
+ 	var aborted atomic.Bool
+ 	if !signal.IsUndefined() {
+@@ -573,12 +571,16 @@ func (ws *jsWebSocket) writeLoop() {
+ 		ws.sendq = ws.sendq[1:]
+ 		code, reason := ws.closeCode, ws.closeWhy
+ 		if out.close {
+-			ws.closing = true
+ 			ws.mu.Unlock()
+-			// Close writes the frame, waits (up to 5 s) for the peer's, and
+-			// closes the connection, which ends readLoop.
+-			ws.closeErr = ws.conn.Close(code, reason)
+-			close(ws.closeDone)
++			if ws.conn.SendClose(code, reason) != nil {
++				ws.conn.CloseNow()
++				return
++			}
++			ws.mu.Lock()
++			if ws.state != wsClosed {
++				ws.closeTimer = time.AfterFunc(5*time.Second, func() { ws.conn.CloseNow() })
++			}
++			ws.mu.Unlock()
+ 			return
+ 		}
+ 		ctx, stop := context.WithCancel(context.Background())
+@@ -608,21 +610,12 @@ func (ws *jsWebSocket) finish(err error) {
+ 		code, reason = int(ce.Code), ce.Reason
+ 	case errors.Is(err, websocket.ErrMessageTooBig):
+ 		code, reason = int(websocket.StatusMessageTooBig), "a message over 64 MiB"
+-	default:
+-		// Close itself may have read the peer's answer to our close frame;
+-		// it returns nil when the peer answered with the same code.
+-		ws.mu.Lock()
+-		closing := ws.closing
+-		ws.mu.Unlock()
+-		if closing {
+-			<-ws.closeDone
+-			if ws.closeErr == nil {
+-				code, reason = int(ws.closeCode), ws.closeWhy
+-			}
+-		}
+ 	}
+ 	ws.mu.Lock()
+ 	ws.state = wsClosed
++	if ws.closeTimer != nil {
++		ws.closeTimer.Stop()
++	}
+ 	ws.ended = true
+ 	ws.sendq = nil
+ 	ws.inflight = 0
+diff --git a/tempfork/coder/websocket/README.md b/tempfork/coder/websocket/README.md
+index 99b83ab..c666bf4 100644
+--- a/tempfork/coder/websocket/README.md
++++ b/tempfork/coder/websocket/README.md
+@@ -16,6 +16,8 @@ The files are upstream's non-test, non-`js` files, unchanged except for:
+   `!amd64 && !arm64`);
+ - the `internal/...` import paths, moved under `tailscale.com/tempfork/coder/websocket`;
+ - `doc.go`'s import comment, removed.
++- `Conn.SendClose`, added: it writes the close frame and leaves reading to the
++  caller, whose `Read` keeps returning data messages until the peer's close frame.
+ 
+ `ws_js.go`, `netconn_js.go`, `internal/wsjs`, `wsjson` and the tests are left out.
+ The rest of Tailscale keeps using `github.com/coder/websocket` itself.
+diff --git a/tempfork/coder/websocket/close.go b/tempfork/coder/websocket/close.go
+index 1f7be9d..6c79072 100644
+--- a/tempfork/coder/websocket/close.go
++++ b/tempfork/coder/websocket/close.go
+@@ -152,6 +152,10 @@ func (c *Conn) CloseNow() (err error) {
+ 	return err
+ }
+ 
++func (c *Conn) SendClose(code StatusCode, reason string) error {
++	return c.writeClose(code, reason)
++}
++
+ func (c *Conn) closeHandshake(code StatusCode, reason string) error {
+ 	err := c.writeClose(code, reason)
+ 	if err != nil {
+-- 
+2.54.0 (Apple Git-157)
+

@@ -218,14 +218,14 @@ function wsServer(port, stats, sinkPort) {
         setTimeout(() => socket.destroy(), 10000);
         return;
       }
-      wsServe(socket, req);
+      wsServe(socket, req, path);
     };
     setTimeout(answer, path === '/slow' ? 5000 : 0);
   });
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)));
 }
 
-function wsServe(socket, req) {
+function wsServe(socket, req, path) {
   let buffer = Buffer.alloc(0);
   let parts = [];
   let partOp = 0;
@@ -274,7 +274,10 @@ function wsServe(socket, req) {
       if (mask) for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
       buffer = buffer.subarray(at + n);
       if (op === 8) {
-        if (!closing) send(8, payload);
+        if (path === '/close-talk') {
+          send(1, Buffer.alloc(1024 * 1024, 'z'));
+          send(8, wsClosePayload(4003, 'talked'));
+        } else if (!closing) send(8, payload);
         socket.end();
         return;
       }
