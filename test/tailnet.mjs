@@ -277,6 +277,10 @@ function wsServe(socket, req, path) {
         if (path === '/close-talk') {
           send(1, Buffer.alloc(1024 * 1024, 'z'));
           send(8, wsClosePayload(4003, 'talked'));
+        } else if (path === '/close-talk-fin') {
+          send(1, Buffer.from('after your close'));
+          socket.end(wsFrame(8, wsClosePayload(4002, 'peer done')));
+          return;
         } else if (!closing) send(8, payload);
         socket.end();
         return;
