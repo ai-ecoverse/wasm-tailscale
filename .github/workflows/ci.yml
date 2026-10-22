@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: read
+  issues: write
+  pull-requests: write
+  statuses: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    uses: ai-ecoverse/slicc-shared-web/.github/workflows/pipeline.yml@v2.8.3
+    secrets: inherit
+    with:
+      shards: 1
+      require-tests: false
+      timeout-minutes: 30
+      review-prompt: |
+        WASM-TAILSCALE
+
+        This repository is wasm-tailscale (`@ai-ecoverse/wasm-tailscale`): Tailscale's tsconnect compiled to js/wasm, with the patches in `patches/` that give SLICC fetch, dial, WebSockets, exit nodes and status over a tailnet. It holds no Tailscale source: `build.sh` clones the tag in `upstream.json`, applies the patches and builds `package/dist/`. The README is the contract.
+
+        Once this pull request passes the merge queue, semantic-release builds `package/` on `main` and publishes it to npm as `<tailscale version>-<n>` (`scripts/release.mjs`), and SLICC pins that release.
+
+        Look for real defects: a patch that breaks the API the README describes or `package/index.d.ts`, shields up that can drop, secrets or the auth key reaching `stateStorage`, logs or errors, anything that serves peers, a release that could publish a tarball other than the build's own, and a behaviour change without a test in `test/`. Run `./build.sh` (it needs the Tailscale clone and Go, about 3 minutes) before any test; `npm test` runs them all, the local tailnet included. No comments anywhere, and a conventional-commit title (`fix`, `feat` and `perf` release, the rest don't). Don't report style preferences, or anything you haven't confirmed.
