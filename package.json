@@ -1,0 +1,29 @@
+{
+  "name": "wasm-tailscale",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Tooling for building, testing and releasing @ai-ecoverse/wasm-tailscale, which is published from package/",
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ai-ecoverse/wasm-tailscale.git"
+  },
+  "fledgling": {
+    "provider": "github",
+    "workflow": "ci.yml",
+    "repo": "ai-ecoverse/wasm-tailscale",
+    "publish": true,
+    "include": ["@ai-ecoverse/wasm-tailscale"]
+  },
+  "scripts": {
+    "lint": "shellcheck build.sh scripts/*.sh && ./build.sh --patches",
+    "test": "node test/release.mjs && ./build.sh && node test/smoke.mjs && node test/empty-control-url.mjs && node test/throwing-callbacks.mjs && node test/storage-failure.mjs newipn && node test/storage-failure.mjs start && node test/login-bursts.mjs healthy && node test/login-bursts.mjs failed-start && scripts/local-tailnet.sh",
+    "release": "semantic-release",
+    "trust": "npx fledgling sync -y --skip-publish",
+    "trust:dry": "npx fledgling sync --dry-run -y --skip-publish"
+  },
+  "devDependencies": {
+    "@ai-ecoverse/slicc-shared-web": "2.8.3",
+    "semantic-release": "25.0.9"
+  }
+}
