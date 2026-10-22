@@ -45,40 +45,38 @@ To load it, run `wasm_exec.js` (it defines `globalThis.Go`), instantiate `main.w
 
 `THIRD-PARTY-NOTICES.md` lists every Go module linked into `main.wasm`, with its licence, copyright and NOTICE files, plus the Go standard library's licence. `build.sh` generates it from `go list -deps` with the build's tags.
 
-Versions are `<tailscale version>-<n>`, for example `1.104.1-1`; `n` counts builds of the same tag.
+Versions are `<tailscale version>-<n>`, for example `1.104.1-1`; `n` counts releases of the same tag.
 
 ## Build
 
 ```sh
 ./build.sh          # clones into .build/tailscale, or set TAILSCALE_SRC
+npm test            # builds, then runs every test below but logout-check
+node test/release.mjs # the next build number and the release's tarball check
 node test/smoke.mjs # reaches Tailscale's control plane, checks shields up and the API
 node test/empty-control-url.mjs # an empty controlURL settles on the default
 node test/throwing-callbacks.mjs # throwing callbacks are survived and reported
 node test/storage-failure.mjs newipn # broken storage: newIPN returns an Error
+node test/storage-failure.mjs start  # broken storage during run(): reported, login() retries, works once storage recovers
 node test/login-bursts.mjs healthy  # l,k,l and l,l,k,l login bursts survive
 node test/login-bursts.mjs failed-start # the same after a failed start, then a URL once storage recovers
-HEADSCALE=… TAILSCALED=… TAILSCALE=… node test/local-tailnet.mjs # a tailnet of its own: join, dial a peer, half-close, WebSockets to the peer by address and name, nothing inbound, exit node by name and ID
-node test/storage-failure.mjs start  # broken storage during run(): reported, login() retries, works once storage recovers
+scripts/local-tailnet.sh # a tailnet of its own: join, dial a peer, half-close, WebSockets to the peer by address and name, nothing inbound, exit node by name and ID
 node test/logout-check.mjs # interactive: join, logout, login again; prints sign-in links to /tmp/logout-check.out
 ```
 
-The build uses Tailscale's pinned Go toolchain (`./tool/go`), `-trimpath`, `-buildvcs=false` and an empty build ID, so the same tag and patches give the same `main.wasm` on any machine. The packed tarball holds the same files everywhere. Its gzip bytes depend on Node's zlib, so CI pins Node `24.22.1`, and `publish` publishes the certified CI artifact itself rather than a repack.
+`scripts/local-tailnet.sh` downloads pinned, sha256-checked headscale 0.29.4 and Tailscale 1.104.1 (Linux x86_64) into a temporary directory, or uses `HEADSCALE`, `TAILSCALED` and `TAILSCALE` when all three are set, and runs `test/local-tailnet.mjs`.
+
+The build uses Tailscale's pinned Go toolchain (`./tool/go`), `-trimpath`, `-buildvcs=false` and an empty build ID, so the same tag, patches and version give the same `main.wasm` on any machine. The version is baked in, so a build outside a release says `0.0.0-dev`.
 
 ## Updating
 
-To move to a new Tailscale tag, rebase the patch series onto it. In a Tailscale clone, apply `patches/*.patch` to the old tag with `git am`, rebase onto the new tag, then refresh `patches/` with `git format-patch <new-tag>..HEAD`. Update `upstream.json`, and set `package/package.json`'s version to `<new version>-1`.
+To move to a new Tailscale tag, rebase the patch series onto it. In a Tailscale clone, apply `patches/*.patch` to the old tag with `git am`, rebase onto the new tag, then refresh `patches/` with `git format-patch <new-tag>..HEAD`. Update `upstream.json`, and the Tailscale version `scripts/local-tailnet.sh` downloads. The first release of the new tag is `<new version>-1`.
 
 ## CI
 
-- **`build`:** runs on every push and pull request. It builds, runs the smoke test, and uploads the packed tarball as the `package` artifact, with `build-info.json`.
-- **`publish`:** run by hand, with the id of a `build` run and the sha256 its certification gave. It publishes **that run's tarball, byte for byte**, with npm trusted publishing (OIDC) and provenance. Before it does, it rebuilds from the checked-out commit and runs [`scripts/assert-certified.mjs`](scripts/assert-certified.mjs), which refuses:
-  - a tarball whose sha256 isn't the certified one;
-  - a tarball whose files differ from the fresh build (compared by the uncompressed tar, because gzip's output differs between platforms while the files don't);
-  - links, or entries outside `package/`;
-  - a tarball without `THIRD-PARTY-NOTICES.md`, `LICENSE` or `dist/main.wasm`;
-  - a different package name, or a version that isn't `X.Y.Z-N`.
+[`ci.yml`](.github/workflows/ci.yml) runs [slicc-shared-web's pipeline](https://github.com/ai-ecoverse/slicc-shared-web#pipeline) on every pull request, in the merge queue and on `main`. `npm run lint` runs shellcheck and checks that `patches/` applies to the pinned tag; `npm test` builds and runs the tests above, in one job; on a pull request, Claude and Codex review the change.
 
-  A version already on npm is skipped. `scripts/pack.sh` packs locally the way CI does and prints the sha256.
+Every push to `main` with a `fix`, `feat` or `perf` commit since the last release releases, through semantic-release ([`.releaserc.json`](.releaserc.json)). [`scripts/release.mjs`](scripts/release.mjs) picks the version, one past the highest `n` npm has for the tag in `upstream.json`, builds `package/` with it and packs it with this README and the LICENSE. It refuses a tarball whose files aren't the ones this build wrote (by `build-info.json` and by the build's own files), that was built from another commit or version, or that holds links or entries outside `package/`. It publishes that tarball with npm trusted publishing (OIDC) and provenance, under `latest`, and the GitHub release names it. semantic-release keeps its own count in the `release-X.Y.Z` git tags, which only mark what has been released.
 
 ## License
 

@@ -1,5 +1,4 @@
 #!/bin/sh
-# Builds package/dist from the pinned Tailscale tag plus patches/*.patch.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 tag=$(node -p "require('$here/upstream.json').tag")
@@ -16,6 +15,9 @@ git -c advice.detachedHead=false checkout --quiet "$commit"
 test "$(git rev-parse HEAD)" = "$commit"
 git reset --quiet --hard "$commit"
 git -c user.name=build -c user.email=build@localhost am --quiet --committer-date-is-author-date "$here"/patches/*.patch
+if [ "${1:-}" = --patches ]; then
+  exit 0
+fi
 
 tags=$(./tool/go run ./cmd/tsconnect/wasmbuild/printtags)
 short=${tag#v}
