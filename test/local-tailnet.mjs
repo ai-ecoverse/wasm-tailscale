@@ -228,6 +228,28 @@ try {
     assert.deepEqual(await linger.messages.next(), { value: undefined, done: true });
     assert.deepEqual(await linger.closed, { code: 4002, reason: 'peer done' }, `closed settles with the peer's close frame after FIN (round ${round})`);
   }
+  const lingerAs = async ({ pending, delay }) => {
+    const owner = new AbortController();
+    const socket = await ipn.websocket({ url: `${base}/close-talk-fin`, signal: owner.signal });
+    const got = [];
+    const read = async () => {
+      for await (const message of socket.messages) got.push(message);
+      return socket.closed;
+    };
+    let reading;
+    if (pending) reading = read();
+    await new Promise((resolve) => setTimeout(() => resolve(socket.close(1000, '')), delay));
+    if (!pending) reading = read();
+    return { got, closed: await reading };
+  };
+  for (const [pending, delay] of [[true, 0], [true, 1000], [false, 0], [false, 1000]]) {
+    for (let round = 1; round <= 5; round++) {
+      const label = `${pending ? 'a pending' : 'no'} next(), close() after ${delay} ms, round ${round}`;
+      const { got, closed } = await lingerAs({ pending, delay });
+      assert.deepEqual(got, ['after your close'], `the peer's message after our close is yielded before messages ends (${label})`);
+      assert.deepEqual(closed, { code: 4002, reason: 'peer done' }, `closed is the peer's close frame (${label})`);
+    }
+  }
   const stats = tailnet.stats;
   const tlsPort = tailnet.peer.tlsPort;
   for (const url of [`wss://${tailnet.peer.ip}:${tlsPort}/`, `wss://${peerDNS}:${tlsPort}/`, `https://${peerDNS}:${tlsPort}/`])
