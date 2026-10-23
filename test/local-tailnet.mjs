@@ -220,6 +220,14 @@ try {
     assert.deepEqual(await talker.messages.next(), { value: undefined, done: true });
     assert.deepEqual(await talker.closed, { code: 4003, reason: 'talked' }, `closed settles with the peer's close frame (round ${round})`);
   }
+  for (let round = 1; round <= 5; round++) {
+    const linger = await ipn.websocket({ url: `${base}/close-talk-fin` });
+    linger.close(1000);
+    const said = await linger.messages.next();
+    assert.deepEqual(said, { value: 'after your close', done: false }, `a small message the peer sends with its close and FIN arrives before done (round ${round})`);
+    assert.deepEqual(await linger.messages.next(), { value: undefined, done: true });
+    assert.deepEqual(await linger.closed, { code: 4002, reason: 'peer done' }, `closed settles with the peer's close frame after FIN (round ${round})`);
+  }
   const stats = tailnet.stats;
   const tlsPort = tailnet.peer.tlsPort;
   for (const url of [`wss://${tailnet.peer.ip}:${tlsPort}/`, `wss://${peerDNS}:${tlsPort}/`, `https://${peerDNS}:${tlsPort}/`])
