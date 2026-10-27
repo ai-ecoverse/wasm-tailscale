@@ -23,7 +23,7 @@
     "trust:dry": "npx fledgling sync --dry-run -y --skip-publish"
   },
   "devDependencies": {
-    "@ai-ecoverse/slicc-shared-web": "2.13.3",
+    "@ai-ecoverse/slicc-shared-web": "2.13.4",
     "semantic-release": "25.0.9"
   }
 }
